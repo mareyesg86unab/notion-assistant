@@ -4,149 +4,157 @@ import openai
 from notion_client import Client as NotionClient
 from dotenv import load_dotenv
 
-# Carga variables de entorno desde .env (en desarrollo)
+# Carga variables de entorno
 load_dotenv()
-
-# Inicializa API clients
 openai.api_key = os.getenv("OPENAI_API_KEY")
 notion = NotionClient(auth=os.getenv("NOTION_API_TOKEN"))
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# ─── Handlers para Notion ──────────────────────────────────────────────────────
-def create_task_notion(title: str, description: str, category: str, assignee: str, due_date: str):
-    """Crea una nueva página en la base de datos de Notion."""
+# ─── Normalización de categorías ─────────────────────────────────────────────
+CATEGORY_MAP = {
+    "estudio":    "Estudios",
+    "estudios":   "Estudios",
+    "domestica":  "Domésticas",
+    "doméstica":  "Domésticas",
+    "domesticas": "Domésticas",
+    "laboral":    "Laborales",
+    "laborales":  "Laborales",
+}
+
+def normalize_category(cat: str) -> str:
+    if not cat:
+        return cat
+    key = cat.strip().lower()
+    return CATEGORY_MAP.get(key, cat.title())
+
+# ─── Helper para buscar ID por título ─────────────────────────────────────────
+def find_task_id_by_title(title: str):
+    """Busca la primera tarea en Notion cuyo título coincida (case-insensitive)."""
+    for t in list_tasks_notion():
+        if t["title"].lower() == title.lower():
+            return t["id"]
+    return None
+
+# ─── Handlers para Notion ─────────────────────────────────────────────────────
+def create_task_notion(**kwargs):
+    title       = kwargs.get("title")
+    description = kwargs.get("description", "")
+    raw_cat     = kwargs.get("category", "")
+    category    = normalize_category(raw_cat)
+    due_date    = kwargs.get("due_date")
+
     notion.pages.create(
         parent={"database_id": DATABASE_ID},
         properties={
-            "Título": {
-                "title": [{"text": {"content": title}}]
-            },
-            "Descripción": {
-                "rich_text": [{"text": {"content": description or ""}}]
-            },
-            "Categoría": {
-                "select": {"name": category}
-            },
-            "Responsable": {
-                "people": [{"name": assignee}]
-            },
-            "Fecha de vencimiento": {
-                "date": {"start": due_date}
-            },
-            "Estado": {
-                "select": {"name": "Por hacer"}
-            }
+            "Nombre de tarea": {"title": [{"text": {"content": title}}]},
+            "Etiquetas": {"multi_select": [{"name": category}]},
+            "Fecha límite": {"date": {"start": due_date}},
+            "Descripción": {"rich_text": [{"text": {"content": description}}]},
+            "Estado": {"status": {"name": "Por hacer"}}
         }
     )
     return {"status": "success", "action": "create_task", "title": title}
 
-def list_tasks_notion(category=None, assignee=None, status=None):
-    """Consulta la base de datos y devuelve tareas filtradas."""
+
+def list_tasks_notion(category=None, status=None):
     filters = []
     if category:
-        filters.append({
-            "property": "Categoría",
-            "select": { "equals": category }
-        })
-    if assignee:
-        filters.append({
-            "property": "Responsable",
-            "people": { "contains": assignee }
-        })
+        cat = normalize_category(category)
+        filters.append({"property": "Etiquetas", "multi_select": {"contains": cat}})
     if status:
-        filters.append({
-            "property": "Estado",
-            "select": { "equals": status }
-        })
+        filters.append({"property": "Estado", "status": {"equals": status}})
+
     query = {"database_id": DATABASE_ID}
     if filters:
         query["filter"] = {"and": filters}
+
     results = notion.databases.query(**query).get("results", [])
-    # Extraemos información relevante
     tasks = []
     for p in results:
         props = p["properties"]
         tasks.append({
-            "id":      p["id"],
-            "title":   props["Título"]["title"][0]["plain_text"],
-            "due":     props["Fecha de vencimiento"]["date"]["start"],
-            "status":  props["Estado"]["select"]["name"],
-            "assignee": [u["name"] for u in props["Responsable"]["people"]]
+            "id":    p["id"],
+            "title": props["Nombre de tarea"]["title"][0]["plain_text"],
+            "due":   props["Fecha límite"]["date"]["start"],
+            "status":props["Estado"]["status"]["name"],
         })
     return tasks
 
-def update_task_notion(task_id: str, status=None, assignee=None):
-    """Actualiza estado o responsable de una tarea existente."""
-    props = {}
-    if status:
-        props["Estado"] = {"select": {"name": status}}
-    if assignee:
-        props["Responsable"] = {"people": [{"name": assignee}]}
-    notion.pages.update(page_id=task_id, properties=props)
+
+def update_task_notion(task_id: str = None, title: str = None, status: str = None):
+    if not task_id and title:
+        task_id = find_task_id_by_title(title)
+        if not task_id:
+            return {"status": "error", "error": f"Tarea '{title}' no encontrada"}
+    notion.pages.update(
+        page_id=task_id,
+        properties={"Estado": {"status": {"name": status}}}
+    )
     return {"status": "success", "action": "update_task", "task_id": task_id}
 
-def delete_task_notion(task_id: str):
-    """Elimina (archiva) una tarea en Notion."""
-    # Marcamos como archivada
+
+def delete_task_notion(task_id: str = None, title: str = None):
+    if not task_id and title:
+        task_id = find_task_id_by_title(title)
+        if not task_id:
+            return {"status": "error", "error": f"Tarea '{title}' no encontrada"}
     notion.pages.update(page_id=task_id, archived=True)
     return {"status": "success", "action": "delete_task", "task_id": task_id}
 
-# ─── Definición de funciones para OpenAI ───────────────────────────────────────
+# ─── Definición de funciones para OpenAI Function Calling ─────────────────────
 functions = [
     {
-      "name": "create_task",
-      "description": "Crea una tarea nueva en Notion",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "title":       { "type": "string" },
-          "description": { "type": "string" },
-          "category":    { "type": "string", "enum": ["Domésticas","Laborales","Estudios"] },
-          "assignee":    { "type": "string" },
-          "due_date":    { "type": "string", "format": "date" }
-        },
-        "required": ["title","category","assignee","due_date"]
-      }
-    },
-    {
-      "name": "list_tasks",
-      "description": "Recupera tareas filtradas por categoría, responsable o estado",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "category": { "type": "string", "enum": ["Domésticas","Laborales","Estudios"] },
-          "assignee": { "type": "string" },
-          "status":   { "type": "string", "enum": ["Por hacer","En progreso","Hecho"] }
+        "name": "create_task",
+        "description": "Crea una tarea nueva en Notion",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title":       {"type": "string"},
+                "description": {"type": "string"},
+                "category":    {"type": "string"},
+                "due_date":    {"type": "string", "format": "date"}
+            },
+            "required": ["title", "category", "due_date"]
         }
-      }
     },
     {
-      "name": "update_task",
-      "description": "Actualiza el estado o responsable de una tarea existente en Notion",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "task_id":  { "type": "string" },
-          "status":   { "type": "string", "enum": ["Por hacer","En progreso","Hecho"] },
-          "assignee": { "type": "string" }
-        },
-        "required": ["task_id"]
-      }
+        "name": "list_tasks",
+        "description": "Recupera tareas filtradas por Etiquetas o Estado",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string"},
+                "status":   {"type": "string", "enum": ["Por hacer","En progreso","Hecho"]}
+            }
+        }
     },
     {
-      "name": "delete_task",
-      "description": "Elimina o marca una tarea como eliminada en Notion",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "task_id": { "type": "string" }
-        },
-        "required": ["task_id"]
-      }
+        "name": "update_task",
+        "description": "Actualiza el estado de una tarea existente en Notion",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "title":   {"type": "string"},
+                "status":  {"type": "string", "enum": ["Por hacer","En progreso","Hecho"]}
+            },
+            "required": ["status"]
+        }
+    },
+    {
+        "name": "delete_task",
+        "description": "Archiva una tarea existente en Notion",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "title":   {"type": "string"}
+            }
+        }
     }
 ]
 
-# ─── Función principal que interactúa con el usuario ───────────────────────────
+# ─── Bucle principal ───────────────────────────────────────────────────────────
 def run_assistant():
     print("🟣 Olivia iniciada. Escribe 'salir' para terminar.\n")
     while True:
@@ -165,25 +173,20 @@ def run_assistant():
         )
 
         msg = response.choices[0].message
-        # Si devuelve function_call, despacho la función
         if msg.get("function_call"):
-            name = msg["function_call"]["name"]
-            args = json.loads(msg["function_call"]["arguments"])
-            # Mapea al handler correspondiente
-            if name == "create_task":
+            fn, args = msg["function_call"]["name"], json.loads(msg["function_call"]["arguments"])
+            if fn == "create_task":
                 result = create_task_notion(**args)
-            elif name == "list_tasks":
+            elif fn == "list_tasks":
                 result = list_tasks_notion(**args)
-            elif name == "update_task":
+            elif fn == "update_task":
                 result = update_task_notion(**args)
-            elif name == "delete_task":
+            elif fn == "delete_task":
                 result = delete_task_notion(**args)
             else:
-                result = {"status":"error","error":"Función desconocida"}
-
+                result = {"status": "error", "error": "Función desconocida"}
             print("Olivia (función):", result, "\n")
         else:
-            # Respuesta directa
             print("Olivia:", msg.content, "\n")
 
 if __name__ == "__main__":
