@@ -385,6 +385,11 @@ if __name__ == "__main__":
     mode = os.getenv("MODE", "cli")
     if mode == "telegram":
         import asyncio
-        asyncio.run(run_telegram_bot())
+        try:
+            asyncio.run(run_telegram_bot())
+        except RuntimeError:
+            # Si ya hay un event loop corriendo (como en Render), usa el loop actual
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(run_telegram_bot())
     else:
         run_cli()
