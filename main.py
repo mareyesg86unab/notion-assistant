@@ -5,6 +5,7 @@ from notion_client import Client as NotionClient
 from dotenv import load_dotenv
 from datetime import datetime
 import dateparser
+import asyncio
 
 # Telegram imports
 from telegram import Update
@@ -384,12 +385,15 @@ async def run_telegram_bot():
 if __name__ == "__main__":
     mode = os.getenv("MODE", "cli")
     if mode == "telegram":
-        import asyncio
         try:
             asyncio.run(run_telegram_bot())
-        except RuntimeError:
-            # Si ya hay un event loop corriendo (como en Render), usa el loop actual
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(run_telegram_bot())
+        except RuntimeError as e:
+            # Para Python 3.11+ y Render: crea un nuevo event loop si no existe
+            if "There is no current event loop" in str(e):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(run_telegram_bot())
+            else:
+                raise
     else:
         run_cli()
