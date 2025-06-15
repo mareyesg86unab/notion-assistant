@@ -1,4 +1,5 @@
-openai<1.0.0
-notion-client
-python-dotenv
-python-telegram-bot~=20.0
+openai>=1.0.0
+notion-client>=2.0.0
+python-dotenv>=1.0.0
+python-telegram-bot>=20.0
+dateparser>=1.1.0
