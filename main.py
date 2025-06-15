@@ -385,15 +385,8 @@ async def run_telegram_bot():
 if __name__ == "__main__":
     mode = os.getenv("MODE", "cli")
     if mode == "telegram":
-        try:
-            asyncio.run(run_telegram_bot())
-        except RuntimeError as e:
-            # Para Python 3.11+ y Render: crea un nuevo event loop si no existe
-            if "There is no current event loop" in str(e):
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(run_telegram_bot())
-            else:
-                raise
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_telegram_bot())
     else:
         run_cli()
