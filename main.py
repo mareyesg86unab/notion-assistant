@@ -3,35 +3,82 @@ import json
 import openai
 from notion_client import Client as NotionClient
 from dotenv import load_dotenv
+from datetime import datetime
+import dateparser
 
 # Telegram imports
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Prompt mejorado para el asistente
+SYSTEM_PROMPT = (
+    "Eres Olivia, una asistente virtual que ayuda a los usuarios a gestionar tareas en Notion. "
+    "Tu objetivo es facilitar la vida del usuario, guiándolo paso a paso y usando un lenguaje sencillo. "
+    "Solo puedes usar las siguientes categorías: Estudios, Domésticas, Laborales. "
+    "Si el usuario menciona una categoría no reconocida, sugiere la más cercana o pídele que elija una válida. "
+    "Acepta fechas en cualquier formato (ej: 'mañana', '21-06-2025', 'el viernes') y conviértelas a formato ISO 8601 (YYYY-MM-DD). "
+    "Si falta información, pregunta solo lo necesario. "
+    "Antes de crear, editar o borrar una tarea, confirma con el usuario. "
+    "Nunca inventes etiquetas nuevas. "
+    "Si el usuario comete errores de tipeo, intenta adivinar la intención y sugiere correcciones."
+)
 
 # Carga variables de entorno
+env_api_key = os.getenv("OPENAI_API_KEY")
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=env_api_key)
 notion = NotionClient(auth=os.getenv("NOTION_API_TOKEN"))
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# ─── Normalización de categorías ─────────────────────────────────────────────
+# ─── Normalización de categorías con sinónimos y sugerencias ──────────────────
 CATEGORY_MAP = {
     "estudio": "Estudios",
     "estudios": "Estudios",
+    "academico": "Estudios",
+    "académico": "Estudios",
+    "universidad": "Estudios",
+    "trabajo": "Laboral",
+    "laboral": "Laboral",
+    "laborales": "Laboral",
+    "empleo": "Laboral",
+    "oficio": "Laboral",
+    "profesional": "Laboral",
     "domestica": "Domésticas",
     "doméstica": "Domésticas",
     "domesticas": "Domésticas",
-    "laboral": "Laborales",
-    "laborales": "Laborales",
+    "casa": "Domésticas",
+    "hogar": "Domésticas",
+    "limpieza": "Domésticas",
 }
+VALID_CATEGORIES = set(CATEGORY_MAP.values())
 
+# Sugerencia de categoría más cercana (fuzzy matching)
+def suggest_category(cat):
+    from difflib import get_close_matches
+    matches = get_close_matches(cat.lower(), CATEGORY_MAP.keys(), n=1, cutoff=0.6)
+    if matches:
+        return CATEGORY_MAP[matches[0]]
+    return None
 
 def normalize_category(cat: str) -> str:
     if not cat:
-        return cat
+        return None
     key = cat.strip().lower()
-    return CATEGORY_MAP.get(key, cat.title())
+    if key in CATEGORY_MAP:
+        return CATEGORY_MAP[key]
+    # Sugerir la más cercana
+    return suggest_category(key)
 
+# ─── Conversión flexible de fechas ─────────────────────────────────────────────
+def normalize_date(date_str):
+    if not date_str:
+        return None
+    # Intenta parsear con dateparser (acepta lenguaje natural y varios formatos)
+    dt = dateparser.parse(date_str, languages=["es", "en"])
+    if dt:
+        return dt.strftime("%Y-%m-%d")
+    # Si no reconoce el formato, retorna None
+    return None
 
 # ─── Helper para buscar ID por título ─────────────────────────────────────────
 def find_task_id_by_title(title: str):
@@ -40,48 +87,55 @@ def find_task_id_by_title(title: str):
             return t["id"]
     return None
 
-
 # ─── Handlers para Notion ─────────────────────────────────────────────────────
 def create_task_notion(**kwargs):
     title = kwargs.get("title")
     description = kwargs.get("description", "")
     raw_cat = kwargs.get("category", "")
     category = normalize_category(raw_cat)
-    due_date = kwargs.get("due_date")
+    due_date = normalize_date(kwargs.get("due_date"))
 
-    notion.pages.create(parent={"database_id": DATABASE_ID},
-                        properties={
-                            "Nombre de tarea": {
-                                "title": [{
-                                    "text": {
-                                        "content": title
+    if not category:
+        return {"status": "error", "error": f"La categoría '{raw_cat}' no es válida. Usa una de estas: {', '.join(VALID_CATEGORIES)}"}
+    if not due_date:
+        return {"status": "error", "error": f"La fecha '{kwargs.get('due_date')}' no es válida. Usa formato DD-MM-YYYY o una fecha en lenguaje natural."}
+
+    try:
+        notion.pages.create(parent={"database_id": DATABASE_ID},
+                            properties={
+                                "Nombre de tarea": {
+                                    "title": [{
+                                        "text": {
+                                            "content": title
+                                        }
+                                    }]
+                                },
+                                "Etiquetas": {
+                                    "multi_select": [{
+                                        "name": category
+                                    }]
+                                },
+                                "Fecha límite": {
+                                    "date": {
+                                        "start": due_date
                                     }
-                                }]
-                            },
-                            "Etiquetas": {
-                                "multi_select": [{
-                                    "name": category
-                                }]
-                            },
-                            "Fecha límite": {
-                                "date": {
-                                    "start": due_date
-                                }
-                            },
-                            "Descripción": {
-                                "rich_text": [{
-                                    "text": {
-                                        "content": description
+                                },
+                                "Descripción": {
+                                    "rich_text": [{
+                                        "text": {
+                                            "content": description
+                                        }
+                                    }]
+                                },
+                                "Estado": {
+                                    "status": {
+                                        "name": "Por hacer"
                                     }
-                                }]
-                            },
-                            "Estado": {
-                                "status": {
-                                    "name": "Por hacer"
                                 }
-                            }
-                        })
-    return {"status": "success", "action": "create_task", "title": title}
+                            })
+        return {"status": "success", "action": "create_task", "title": title, "category": category, "due_date": due_date}
+    except Exception as e:
+        return {"status": "error", "error": f"Error al crear la tarea en Notion: {str(e)}"}
 
 
 def list_tasks_notion(category=None, status=None):
@@ -106,14 +160,10 @@ def list_tasks_notion(category=None, status=None):
     for p in results:
         props = p["properties"]
         tasks.append({
-            "id":
-            p["id"],
-            "title":
-            props["Nombre de tarea"]["title"][0]["plain_text"],
-            "due":
-            props["Fecha límite"]["date"]["start"],
-            "status":
-            props["Estado"]["status"]["name"],
+            "id": p["id"],
+            "title": props["Nombre de tarea"]["title"][0]["plain_text"],
+            "due": props["Fecha límite"]["date"]["start"],
+            "status": props["Estado"]["status"]["name"],
         })
     return tasks
 
@@ -223,37 +273,60 @@ functions = [{
 }]
 
 
+# ─── Historial de conversación ────────────────────────────────────────────────
+cli_history = [
+    {"role": "system", "content": SYSTEM_PROMPT}
+]
+
+def add_to_history(history, role, content):
+    history.append({"role": role, "content": content})
+    if len(history) > 10:
+        del history[1]
+
+
 # ─── Handlers de Telegram ──────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["history"] = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
     await update.message.reply_text(
         "¡Hola! Soy Olivia 🤖. Escríbeme tu comando para Notion.")
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "history" not in context.user_data:
+        context.user_data["history"] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+    history = context.user_data["history"]
     user_input = update.message.text
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{
-            "role":
-            "system",
-            "content":
-            "Eres Olivia, la asistente que organiza tareas en Notion."
-        }, {
-            "role": "user",
-            "content": user_input
-        }],
+    add_to_history(history, "user", user_input)
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=history,
         functions=functions,
         function_call="auto")
     msg = response.choices[0].message
-    if msg.get("function_call"):
-        fn, args = msg["function_call"]["name"], json.loads(
-            msg["function_call"]["arguments"])
-        if fn == "create_task": result = create_task_notion(**args)
-        elif fn == "list_tasks": result = list_tasks_notion(**args)
-        elif fn == "update_task": result = update_task_notion(**args)
-        elif fn == "delete_task": result = delete_task_notion(**args)
-        else: result = {"status": "error", "error": "Función desconocida"}
-        await update.message.reply_text(f"✅ {result}")
+    add_to_history(history, "assistant", msg.content)
+    if hasattr(msg, "function_call") and msg.function_call is not None:
+        fn = msg.function_call.name
+        args = json.loads(msg.function_call.arguments)
+        if fn == "create_task":
+            result = create_task_notion(**args)
+            if result["status"] == "success":
+                await update.message.reply_text(f"✅ Tarea creada: {result['title']} (Categoría: {result['category']}, Fecha: {result['due_date']})")
+            else:
+                await update.message.reply_text(f"❌ {result['error']}")
+        elif fn == "list_tasks":
+            result = list_tasks_notion(**args)
+            await update.message.reply_text(f"Tareas: {result}")
+        elif fn == "update_task":
+            result = update_task_notion(**args)
+            await update.message.reply_text(f"{result}")
+        elif fn == "delete_task":
+            result = delete_task_notion(**args)
+            await update.message.reply_text(f"{result}")
+        else:
+            await update.message.reply_text("❌ Función desconocida")
     else:
         await update.message.reply_text(msg.content)
 
@@ -261,45 +334,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Lanzadores ──────────────────────────────────────────────────────────────
 def run_cli():
     print("🟣 Olivia iniciada. Escribe 'salir' para terminar.\n")
+    global cli_history
     while True:
         user_input = input("Tú: ")
         if user_input.lower().strip() in ("salir", "exit", "quit"): break
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{
-                "role":
-                "system",
-                "content":
-                "Eres Olivia, la asistente que organiza tareas en Notion."
-            }, {
-                "role": "user",
-                "content": user_input
-            }],
+        add_to_history(cli_history, "user", user_input)
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=cli_history,
             functions=functions,
             function_call="auto")
         msg = response.choices[0].message
-        if msg.get("function_call"):
-            fn, args = msg["function_call"]["name"], json.loads(
-                msg["function_call"]["arguments"])
-            if fn == "create_task": res = create_task_notion(**args)
-            elif fn == "list_tasks": res = list_tasks_notion(**args)
-            elif fn == "update_task": res = update_task_notion(**args)
-            elif fn == "delete_task": res = delete_task_notion(**args)
-            else: res = {"status": "error", "error": "Función desconocida"}
-            print("Olivia (función):", res, "\n")
+        add_to_history(cli_history, "assistant", msg.content)
+        if hasattr(msg, "function_call") and msg.function_call is not None:
+            fn = msg.function_call.name
+            args = json.loads(msg.function_call.arguments)
+            if fn == "create_task":
+                res = create_task_notion(**args)
+                if res["status"] == "success":
+                    print(f"✅ Tarea creada: {res['title']} (Categoría: {res['category']}, Fecha: {res['due_date']})\n")
+                else:
+                    print(f"❌ {res['error']}\n")
+            elif fn == "list_tasks":
+                res = list_tasks_notion(**args)
+                print("Tareas:", res, "\n")
+            elif fn == "update_task":
+                res = update_task_notion(**args)
+                print(res, "\n")
+            elif fn == "delete_task":
+                res = delete_task_notion(**args)
+                print(res, "\n")
+            else:
+                print("❌ Función desconocida\n")
         else:
             print("Olivia:", msg.content, "\n")
 
 
 async def run_telegram_bot():
-    token = os.getenv("TELEGRAM_TOKEN")
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    await app.start()
-    print("🚀 Bot de Telegram iniciado")
-    await app.updater.start_polling()
+    application = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start the bot
+    await application.run_polling()
 
 
 if __name__ == "__main__":
