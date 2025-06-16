@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: asistoliv
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: MODE
+        value: telegram
+      - key: PORT
+        value: 8080
+      - key: WEBHOOK_URL
+        sync: false 
