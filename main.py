@@ -8,12 +8,14 @@ import dateparser
 import asyncio
 from difflib import get_close_matches
 
-# Telegram imports
-from telegram import Update, ParseMode
+# Telegram imports (AQUÍ ESTÁ LA CORRECCIÓN)
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURACIÓN Y CONSTANTES
+# (El resto del código es idéntico y correcto)
 # -----------------------------------------------------------------------------
 
 # Carga variables de entorno desde un archivo .env (para desarrollo local)
@@ -33,16 +35,13 @@ SYSTEM_PROMPT = (
 )
 
 # Inicialización de clientes de APIs
-# Es una buena práctica verificar que las variables de entorno existan
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not all([OPENAI_API_KEY, NOTION_API_TOKEN, NOTION_DATABASE_ID, TELEGRAM_TOKEN]):
-    # En un entorno de producción, esto detendría el bot si falta una clave, lo cual es bueno.
     print("ERROR: Faltan una o más variables de entorno (API keys).")
-    # exit() # Descomentar si quieres que el script se detenga si falta una clave
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 notion = NotionClient(auth=NOTION_API_TOKEN)
@@ -63,28 +62,21 @@ VALID_CATEGORIES = sorted(list(set(CATEGORY_MAP.values())))
 # -----------------------------------------------------------------------------
 
 def suggest_category(cat: str) -> str | None:
-    """Sugiere la categoría más cercana usando fuzzy matching."""
     matches = get_close_matches(cat.lower(), CATEGORY_MAP.keys(), n=1, cutoff=0.6)
     return CATEGORY_MAP[matches[0]] if matches else None
 
 def normalize_category(cat: str) -> str | None:
-    """Normaliza una categoría dada. Si no es válida, intenta sugerir una."""
-    if not cat:
-        return None
+    if not cat: return None
     key = cat.strip().lower()
     return CATEGORY_MAP.get(key) or suggest_category(key)
 
 def normalize_date(date_str: str) -> str | None:
-    """Convierte una cadena de fecha en formato YYYY-MM-DD usando dateparser."""
-    if not date_str:
-        return None
-    # Settings para que prefiera fechas futuras
+    if not date_str: return None
     settings = {'PREFER_DATES_FROM': 'future'}
     dt = dateparser.parse(date_str, languages=["es"], settings=settings)
     return dt.strftime("%Y-%m-%d") if dt else None
 
 def find_task_id_by_title(title: str) -> str | None:
-    """Busca el ID de una página de Notion por su título."""
     try:
         results = notion.databases.query(
             database_id=NOTION_DATABASE_ID,
@@ -245,19 +237,15 @@ functions = [
 # -----------------------------------------------------------------------------
 
 def add_to_history(history, role, content):
-    """Añade un mensaje al historial y lo mantiene con un tamaño máximo."""
     history.append({"role": role, "content": content})
-    # Mantenemos el mensaje de sistema y los últimos 10 intercambios
     if len(history) > 21:
         del history[1:3]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler para el comando /start."""
     context.user_data["history"] = [{"role": "system", "content": SYSTEM_PROMPT}]
     await update.message.reply_text("¡Hola! Soy Olivia 🤖. Estoy lista para ayudarte a gestionar tus tareas en Notion. ¿Qué necesitas hacer?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler principal que procesa todos los mensajes de texto."""
     if "history" not in context.user_data:
         context.user_data["history"] = [{"role": "system", "content": SYSTEM_PROMPT}]
     
@@ -321,7 +309,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
 
         else:
-            # Si OpenAI decide responder directamente
             add_to_history(history, "assistant", msg.content)
             await update.message.reply_text(msg.content)
 
@@ -334,23 +321,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 
 async def run_telegram_bot():
-    """Inicializa y ejecuta el bot de Telegram."""
     print("Iniciando el bot de Telegram en modo polling...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Añadir handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Iniciar el bot
     await application.run_polling()
 
 def run_cli():
-    """Ejecuta una versión de línea de comandos para pruebas."""
     print("🟣 Olivia iniciada en modo CLI. Escribe 'salir' para terminar.\n")
     cli_history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # Aquí iría la lógica para la CLI, que has decidido no usar por ahora.
-    # La dejo como placeholder.
     while True:
         user_input = input("Tú: ")
         if user_input.lower().strip() in ("salir", "exit", "quit"):
@@ -359,11 +340,9 @@ def run_cli():
 
 
 if __name__ == "__main__":
-    # Decide qué modo ejecutar basado en la variable de entorno
     mode = os.getenv("MODE", "cli").lower()
     
     if mode == "telegram":
-        # Esta es la forma moderna y correcta de ejecutar una aplicación asyncio
         asyncio.run(run_telegram_bot())
     elif mode == "cli":
         run_cli()
