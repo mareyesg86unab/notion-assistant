@@ -11,6 +11,7 @@ import nest_asyncio
 import logging
 from unidecode import unidecode
 import string
+import re
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +66,19 @@ CATEGORY_MAP = {
 }
 VALID_CATEGORIES = sorted(list(set(CATEGORY_MAP.values())))
 
+ORDINAL_MAP = {
+    "primera": 1, "primer": 1, "1ra": 1, "1era": 1, "1er": 1, "uno": 1, "1": 1,
+    "segunda": 2, "segundo": 2, "2da": 2, "2do": 2, "dos": 2, "2": 2,
+    "tercera": 3, "tercer": 3, "3ra": 3, "3er": 3, "tres": 3, "3": 3,
+    "cuarta": 4, "cuarto": 4, "4ta": 4, "4to": 4, "cuatro": 4, "4": 4,
+    "quinta": 5, "quinto": 5, "5ta": 5, "5to": 5, "cinco": 5, "5": 5,
+    "sexta": 6, "sexto": 6, "6ta": 6, "6to": 6, "seis": 6, "6": 6,
+    "septima": 7, "septimo": 7, "7ma": 7, "7mo": 7, "siete": 7, "7": 7,
+    "octava": 8, "octavo": 8, "8va": 8, "8vo": 8, "ocho": 8, "8": 8,
+    "novena": 9, "noveno": 9, "9na": 9, "9no": 9, "nueve": 9, "9": 9,
+    "decima": 10, "decimo": 10, "10ma": 10, "10mo": 10, "diez": 10, "10": 10
+}
+
 # -----------------------------------------------------------------------------
 # 2. FUNCIONES AUXILIARES (Helpers)
 # -----------------------------------------------------------------------------
@@ -116,6 +130,19 @@ def find_task_id_by_title(title: str) -> tuple[str | None, str | None]:
     except Exception as e:
         logging.error(f"Error en find_task_id_by_title: {e}")
         return None, None
+
+def extract_task_index(user_input: str) -> int | None:
+    """Detecta si el usuario se refiere a una tarea por posición (primera, tarea 1, etc.) y devuelve el índice (base 0)."""
+    user_input = user_input.lower()
+    # Buscar patrones como 'primera tarea', 'tarea 2', 'segunda tarea', etc.
+    for word, idx in ORDINAL_MAP.items():
+        if re.search(rf"\b{word}\b.*tarea|tarea.*\b{word}\b", user_input):
+            return idx - 1  # base 0
+    # Buscar 'tarea N'
+    m = re.search(r"tarea\s*(\d+)", user_input)
+    if m:
+        return int(m.group(1)) - 1
+    return None
 
 # -----------------------------------------------------------------------------
 # 3. LÓGICA DE INTERACCIÓN CON NOTION
@@ -304,6 +331,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Operación cancelada. No se creó la tarea. Si necesitas ayuda, puedes escribir /help o ver tareas similares con '¿Qué tareas tengo?'")
         return
+
+    # Detectar referencia a tarea por posición
+    idx = extract_task_index(user_input)
+    if idx is not None:
+        # Obtener lista de tareas actuales
+        tasks = list_tasks_notion()
+        if isinstance(tasks, dict) and tasks.get("status") == "error":
+            await update.message.reply_text(f"❌ Error: {tasks['message']}")
+            return
+        if 0 <= idx < len(tasks):
+            # Reemplazar en el user_input el texto de referencia por el título real
+            real_title = tasks[idx]["title"]
+            # Reemplazar 'primera tarea', 'tarea 1', etc. por el título real
+            user_input = re.sub(r"(primera|primer|1ra|1era|1er|uno|1|segunda|segundo|2da|2do|dos|2|tercera|tercer|3ra|3er|tres|3|cuarta|cuarto|4ta|4to|cuatro|4|quinta|quinto|5ta|5to|cinco|5|sexta|sexto|6ta|6to|seis|6|septima|septimo|7ma|7mo|siete|7|octava|octavo|8va|8vo|ocho|8|novena|noveno|9na|9no|nueve|9|decima|decimo|10ma|10mo|diez|10)\s*tarea|tarea\s*(\d+)", real_title, user_input, flags=re.IGNORECASE)
+            # Actualizar el historial con el nuevo input
+            history[-1]["content"] = user_input
+        else:
+            await update.message.reply_text(f"No hay una tarea en la posición indicada. Actualmente tienes {len(tasks)} tareas.")
+            return
 
     try:
         response = client.chat.completions.create(
