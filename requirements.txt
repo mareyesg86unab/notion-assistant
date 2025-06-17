@@ -1,6 +1,6 @@
 openai>=1.0.0
 notion-client>=2.0.0
 python-dotenv>=1.0.0
-python-telegram-bot==21.1.1
+python-telegram-bot[webhooks]==21.1.1
 dateparser>=1.1.0
 nest_asyncio
