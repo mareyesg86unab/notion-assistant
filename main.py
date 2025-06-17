@@ -8,6 +8,12 @@ import dateparser
 import asyncio
 from difflib import get_close_matches
 import nest_asyncio
+import logging
+from unidecode import unidecode
+import string
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
 
 # Telegram imports (AQUÍ ESTÁ LA CORRECCIÓN)
 from telegram import Update
@@ -32,7 +38,8 @@ SYSTEM_PROMPT = (
     "Si falta información, pregunta solo lo necesario. "
     "Antes de crear, editar o borrar una tarea, confirma con el usuario si la instrucción no es explícita. "
     "Nunca inventes etiquetas nuevas. "
-    "Si el usuario comete errores de tipeo, intenta adivinar la intención y sugiere correcciones."
+    "Si el usuario comete errores de tipeo, intenta adivinar la intención y sugiere correcciones. "
+    "Nunca crees una tarea nueva a menos que el usuario lo solicite claramente. Si el nombre de la tarea no coincide exactamente, sugiere la tarea más parecida y pide confirmación antes de crear una nueva."
 )
 
 # Inicialización de clientes de APIs
@@ -77,15 +84,38 @@ def normalize_date(date_str: str) -> str | None:
     dt = dateparser.parse(date_str, languages=["es"], settings=settings)
     return dt.strftime("%Y-%m-%d") if dt else None
 
-def find_task_id_by_title(title: str) -> str | None:
+def normalize_title(title: str) -> str:
+    if not title:
+        return ""
+    # Quitar tildes, minúsculas, quitar puntuación y espacios extra
+    title = unidecode(title.lower())
+    title = title.translate(str.maketrans('', '', string.punctuation))
+    title = " ".join(title.split())
+    return title
+
+def find_task_id_by_title(title: str) -> tuple[str | None, str | None]:
+    """
+    Busca el ID de la tarea por título exacto o aproximado (normalizado).
+    Devuelve (id, nombre_real) si encuentra, o (None, None) si no.
+    """
     try:
-        results = notion.databases.query(
-            database_id=NOTION_DATABASE_ID,
-            filter={"property": "Nombre de tarea", "title": {"equals": title}}
-        ).get("results", [])
-        return results[0]["id"] if results else None
-    except Exception:
-        return None
+        norm_title = normalize_title(title)
+        # Buscar coincidencia exacta (normalizada)
+        all_tasks = notion.databases.query(database_id=NOTION_DATABASE_ID).get("results", [])
+        task_titles = [p["properties"]["Nombre de tarea"]["title"][0]["plain_text"] for p in all_tasks if p["properties"]["Nombre de tarea"]["title"]]
+        norm_task_titles = [normalize_title(t) for t in task_titles]
+        if norm_title in norm_task_titles:
+            idx = norm_task_titles.index(norm_title)
+            return all_tasks[idx]["id"], task_titles[idx]
+        # Si no hay coincidencia exacta, buscar aproximada
+        matches = get_close_matches(norm_title, norm_task_titles, n=1, cutoff=0.6)
+        if matches:
+            idx = norm_task_titles.index(matches[0])
+            return all_tasks[idx]["id"], task_titles[idx]
+        return None, None
+    except Exception as e:
+        logging.error(f"Error en find_task_id_by_title: {e}")
+        return None, None
 
 # -----------------------------------------------------------------------------
 # 3. LÓGICA DE INTERACCIÓN CON NOTION
@@ -103,6 +133,14 @@ def create_task_notion(**kwargs):
     if not due_date:
         return {"status": "error", "message": f"La fecha '{kwargs.get('due_date')}' no es válida. Intenta con 'mañana', 'próximo viernes' o 'DD-MM-YYYY'."}
 
+    # Antes de crear, verifica si existe una tarea similar
+    _, similar_title = find_task_id_by_title(title)
+    if similar_title:
+        return {
+            "status": "confirm",
+            "message": f"Ya existe una tarea similar llamada '{similar_title}'. ¿Seguro que quieres crear una nueva tarea llamada '{title}'? Responde 'Sí, crear' para confirmar."
+        }
+
     try:
         notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
@@ -116,6 +154,7 @@ def create_task_notion(**kwargs):
         )
         return {"status": "success", "action": "create_task", "title": title, "category": category, "due_date": due_date}
     except Exception as e:
+        logging.error(f"Error al crear la tarea en Notion: {e}")
         return {"status": "error", "message": f"Error al crear la tarea en Notion: {e}"}
 
 def list_tasks_notion(category=None, status=None):
@@ -149,13 +188,12 @@ def list_tasks_notion(category=None, status=None):
 
 def update_task_notion(task_id: str = None, title: str = None, status: str = None):
     if not task_id and title:
-        task_id = find_task_id_by_title(title)
+        task_id, real_title = find_task_id_by_title(title)
         if not task_id:
-            return {"status": "error", "message": f"Tarea '{title}' no encontrada."}
-    
+            return {"status": "error", "message": f"Tarea '{title}' no encontrada. ¿Quizás quisiste decir '{real_title}'?"} if real_title else {"status": "error", "message": f"Tarea '{title}' no encontrada."}
+        title = real_title  # Usar el nombre real para feedback
     if not task_id:
         return {"status": "error", "message": "Se necesita el título o ID de la tarea para actualizarla."}
-
     try:
         notion.pages.update(page_id=task_id, properties={"Estado": {"status": {"name": status}}})
         return {"status": "success", "action": "update_task", "title": title or f"ID {task_id}", "new_status": status}
@@ -254,12 +292,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text
     add_to_history(history, "user", user_input)
 
+    # Manejo de confirmación para crear tarea
+    if context.user_data.get("pending_create_task"):
+        pending = context.user_data.pop("pending_create_task")
+        if user_input.strip().lower() in ["sí, crear", "si, crear", "crear", "sí", "si"]:
+            result = create_task_notion(**pending)
+            if result["status"] == "success":
+                await update.message.reply_text(f"✅ ¡Tarea creada! \n<b>Título:</b> {result['title']}\n<b>Categoría:</b> {result['category']}\n<b>Fecha:</b> {result['due_date']}", parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(f"❌ Error: {result['message']}")
+        else:
+            await update.message.reply_text("Operación cancelada. No se creó la tarea. Si necesitas ayuda, puedes escribir /help o ver tareas similares con '¿Qué tareas tengo?'")
+        return
+
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=history,
             functions=functions,
-            function_call="auto"
+            function_call="auto",
+            temperature=0.3  # Más precisión, menos inventos
         )
         msg = response.choices[0].message
 
@@ -275,6 +327,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = create_task_notion(**args)
                 if result["status"] == "success":
                     reply_text = f"✅ ¡Tarea creada! \n<b>Título:</b> {result['title']}\n<b>Categoría:</b> {result['category']}\n<b>Fecha:</b> {result['due_date']}"
+                elif result["status"] == "confirm":
+                    # Guardar los datos pendientes y pedir confirmación
+                    context.user_data["pending_create_task"] = args
+                    reply_text = result["message"]
                 else:
                     reply_text = f"❌ Error: {result['message']}"
 
@@ -314,7 +370,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg.content)
 
     except Exception as e:
-        print(f"Error en handle_message: {e}")
+        logging.error(f"Error en handle_message: {e}")
         await update.message.reply_text("Lo siento, ocurrió un error inesperado al procesar tu solicitud.")
 
 # -----------------------------------------------------------------------------
