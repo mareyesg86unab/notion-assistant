@@ -4,10 +4,18 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    envVars:
-      - key: MODE
-        value: telegram
-      - key: PORT
-        value: 8080
-      - key: WEBHOOK_URL
-        sync: false 
+  envVars:
+     - key: MODE
+       value: telegram
+     - key: PORT
+       value: 8080
+     - key: WEBHOOK_URL
+       sync: false
+     - key: OPENAI_API_KEY
+       sync: false
+     - key: NOTION_API_TOKEN
+       sync: false
+     - key: NOTION_DATABASE_ID
+       sync: false
+     - key: TELEGRAM_TOKEN
+       sync: false
