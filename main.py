@@ -7,6 +7,7 @@ from datetime import datetime
 import dateparser
 import asyncio
 from difflib import get_close_matches
+import nest_asyncio
 
 # Telegram imports (AQUÍ ESTÁ LA CORRECCIÓN)
 from telegram import Update
@@ -359,7 +360,9 @@ if __name__ == "__main__":
     
     if mode == "telegram":
         import asyncio
-        asyncio.run(run_telegram_bot())
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(run_telegram_bot())
     elif mode == "cli":
         run_cli()
     else:
