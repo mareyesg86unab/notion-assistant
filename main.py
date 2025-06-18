@@ -202,16 +202,20 @@ def list_tasks_notion(category=None, status=None):
         tasks = []
         for p in results:
             props = p["properties"]
+            # Validar que el campo de título existe y tiene datos
+            title_list = props.get("Nombre de tarea", {}).get("title", [])
+            title = title_list[0]["plain_text"] if title_list else "(Sin título)"
+            due = props.get("Fecha límite", {}).get("date", {}).get("start", "N/A")
+            status_val = props.get("Estado", {}).get("status", {}).get("name", "N/A")
             tasks.append({
                 "id": p["id"],
-                "title": props["Nombre de tarea"]["title"][0]["plain_text"],
-                "due": props["Fecha límite"]["date"]["start"] if props.get("Fecha límite", {}).get("date") else "N/A",
-                "status": props["Estado"]["status"]["name"],
+                "title": title,
+                "due": due,
+                "status": status_val,
             })
         return tasks
     except Exception as e:
         return {"status": "error", "message": f"Error al listar tareas: {e}"}
-
 
 def update_task_notion(task_id: str = None, title: str = None, status: str = None):
     if not task_id and title:
