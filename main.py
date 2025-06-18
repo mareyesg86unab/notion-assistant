@@ -198,17 +198,19 @@ def list_tasks_notion(category=None, status=None):
         query["filter"] = {"and": filters}
 
     try:
-        results = notion.databases.query(**query).get("results", [])
+        response = notion.databases.query(**query)
+        if not response or not isinstance(response, dict):
+            return {"status": "error", "message": "No se pudo obtener respuesta válida de Notion. Verifica tu API key, permisos y el ID de la base de datos."}
+        results = response.get("results", [])
         tasks = []
         for p in results:
-            props = p["properties"]
-            # Validar que el campo de título existe y tiene datos
+            props = p.get("properties", {})
             title_list = props.get("Nombre de tarea", {}).get("title", [])
             title = title_list[0]["plain_text"] if title_list else "(Sin título)"
             due = props.get("Fecha límite", {}).get("date", {}).get("start", "N/A")
             status_val = props.get("Estado", {}).get("status", {}).get("name", "N/A")
             tasks.append({
-                "id": p["id"],
+                "id": p.get("id", ""),
                 "title": title,
                 "due": due,
                 "status": status_val,
