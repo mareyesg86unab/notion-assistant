@@ -306,28 +306,19 @@ def set_reminder_for_task(chat_id: int, task_id: str, reminder_str: str):
         return {"status": "error", "message": f"Ocurrió un error al procesar el recordatorio: {e}"}
 
 def delete_task_notion(task_id: str = None, title: str = None):
+    """
+    Archiva una tarea en Notion (equivalente a eliminarla de la vista principal).
+    Busca la tarea si solo se proporciona el título.
+    """
     if not task_id and title:
-        task_id, real_title, search_method = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
-
+        task_id, _, _ = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
+        
         if not task_id:
-            return {"status": "error", "message": f"Tarea '{title}' no encontrada."}
-
-        # Oportunidad de aprendizaje
-        if search_method in ["substring", "fuzzy"]:
-            return {
-                "status": "confirm_alias",
-                "message": f"He encontrado la tarea '{real_title}'. ¿Te refieres a esa?",
-                "data": {
-                    "task_id": task_id,
-                    "real_title": real_title,
-                    "potential_alias": title,
-                    "original_intent": {"action": "delete"}
-                }
-            }
-        title = real_title # Usar el nombre real para feedback
-
+            # Devolvemos un estado especial para que el handler sepa que no se encontró
+            return {"status": "not_found"}
+    
     if not task_id:
-        return {"status": "error", "message": "Se necesita el título o ID de la tarea para eliminarla."}
+        return {"status": "error", "message": "Se requiere un título o ID de tarea para eliminarla."}
 
     try:
         notion.pages.update(page_id=task_id, archived=True)
@@ -406,6 +397,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id, "Tareas restantes:", reply_markup=keyboard)
             else:
                 await context.bot.send_message(chat_id, "¡Felicidades, has completado todas las tareas de esta lista!")
+
+    # --- Creación Proactiva ---
+    elif data.startswith("proactive_create_"):
+        # Extraemos el título del callback_data. El prefijo es "proactive_create_"
+        title_to_create = data[17:]
+        await query.edit_message_text(text=f"Creando tarea '{title_to_create}'...")
+        
+        # Llamamos directamente a la función de creación de Notion
+        result = create_task_notion(title=title_to_create)
+        
+        message = result.get("message", "No se pudo obtener un mensaje de estado.")
+        # Enviamos un nuevo mensaje con el resultado, en lugar de editar el anterior.
+        await context.bot.send_message(chat_id, message)
+
+    elif data == "proactive_cancel":
+        await query.edit_message_text(text="Ok, acción cancelada.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mensaje de bienvenida."""
@@ -498,6 +505,92 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error en handle_message: {e}")
         await update.message.reply_text("Lo siento, ocurrió un error inesperado al procesar tu solicitud.")
+
+async def edit_task_properties_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **params):
+    """Manejador para la acción de editar propiedades de una tarea."""
+    task_id = params.get("task_id")
+    title_to_find = params.get("title")
+    
+    if not task_id and not title_to_find:
+        await context.bot.send_message(chat_id, "Necesito el título o ID de la tarea que quieres modificar.")
+        return
+    
+    # Si no tenemos ID, buscamos la tarea por título
+    if not task_id:
+        task_id, real_title, search_method = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title_to_find)
+        
+        if not task_id:
+            await offer_proactive_creation(context, chat_id, title_to_find)
+            return
+        
+        # Oportunidad de aprendizaje: si se encontró de forma ambigua, preguntamos para crear un alias
+        if search_method in ["substring", "fuzzy"]:
+            # Aquí iría la lógica para preguntar al usuario si quiere guardar un alias
+            pass
+
+    # Llamar a la función que interactúa con la BD
+    result = edit_task_properties(task_id=task_id, **params)
+
+    message = result.get("message", "No se pudo obtener un mensaje de estado.")
+    await context.bot.send_message(chat_id, message)
+
+async def delete_task_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **params):
+    """Manejador para la acción de eliminar (archivar) tareas."""
+    title_to_find = params.get("title")
+    if not title_to_find:
+        await context.bot.send_message(chat_id, "Necesito el título de la tarea que quieres eliminar.")
+        return
+
+    # A diferencia de otros handlers, para eliminar no buscamos ID, se lo pasamos a la función de Notion
+    # que ya tiene la lógica de búsqueda.
+    result = delete_task_notion(**params)
+
+    # Si la función de borrado devuelve 'not_found', ofrecemos crear la tarea.
+    if result.get("status") == "not_found":
+        await offer_proactive_creation(context, chat_id, title_to_find)
+        return
+        
+    message = result.get("message", "No se pudo obtener un mensaje de estado.")
+    await context.bot.send_message(chat_id, message)
+
+async def set_reminder_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **params):
+    """Manejador para la acción de establecer recordatorios."""
+    title_to_find = params.get("title")
+    reminder_str = params.get("reminder_str")
+    if not title_to_find or not reminder_str:
+        await context.bot.send_message(chat_id, "Necesito el título de la tarea y la configuración del recordatorio.")
+        return
+
+    # Usamos nuestro nuevo buscador de tareas
+    task_id, real_title, _ = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title_to_find)
+
+    if not task_id:
+        await offer_proactive_creation(context, chat_id, title_to_find)
+        return
+
+    # Llamar a la función que interactúa con la BD
+    result_message = set_reminder_for_task(chat_id=chat_id, task_id=task_id, reminder_str=reminder_str)
+
+    await context.bot.send_message(chat_id, result_message)
+
+async def unknown_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_input: str):
+    """Manejador para cuando la intención del usuario no es clara."""
+    # Podríamos añadir una lógica más sofisticada aquí, como sugerir comandos.
+    await context.bot.send_message(chat_id, "No estoy segura de cómo ayudarte con eso. Intenta ser más específica, por favor.")
+
+async def offer_proactive_creation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str):
+    """Función auxiliar para ofrecer la creación de una tarea no encontrada."""
+    if not title: return
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Sí, crear", callback_data=f"proactive_create_{title}")],
+        [InlineKeyboardButton("❌ No, gracias", callback_data="proactive_cancel")]
+    ])
+    await context.bot.send_message(
+        chat_id,
+        f"No he podido encontrar la tarea '{title}'.\n\n¿Quieres que cree una nueva tarea con ese nombre?",
+        reply_markup=keyboard
+    )
 
 # -----------------------------------------------------------------------------
 # 7. TAREAS PROGRAMADAS Y COMANDOS ESPECIALES
