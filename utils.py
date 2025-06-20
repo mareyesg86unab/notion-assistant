@@ -18,9 +18,11 @@ logging.basicConfig(level=logging.INFO)
 DB_FILE = "reminders.db"
 
 def init_db():
-    """Inicializa la base de datos para los recordatorios."""
+    """Inicializa la base de datos para recordatorios y alias."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
+    # Tabla de recordatorios
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS reminders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,9 +32,57 @@ def init_db():
         status TEXT DEFAULT 'pending'
     )
     """)
+    
+    # Tabla de alias para tareas
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS task_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alias_text TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL
+    )
+    """)
+    
     conn.commit()
     conn.close()
-    logging.info("Base de datos de recordatorios inicializada.")
+    logging.info("Base de datos de recordatorios y alias inicializada.")
+
+# --- Funciones de gestión de Alias ---
+
+def add_alias(alias_text: str, task_id: str):
+    """Guarda o actualiza un alias para un ID de tarea."""
+    norm_alias = normalize_title(alias_text)
+    if not norm_alias:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Usar INSERT OR REPLACE para que si el alias ya existe, se actualice su task_id
+    cursor.execute("INSERT OR REPLACE INTO task_aliases (alias_text, task_id) VALUES (?, ?)", (norm_alias, task_id))
+    conn.commit()
+    conn.close()
+    logging.info(f"Alias guardado: '{norm_alias}' -> {task_id}")
+
+def find_task_id_by_alias(alias_text: str) -> str | None:
+    """Busca un ID de tarea usando un alias."""
+    norm_alias = normalize_title(alias_text)
+    if not norm_alias:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT task_id FROM task_aliases WHERE alias_text = ?", (norm_alias,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def get_task_by_id(notion: NotionClient, task_id: str) -> tuple[str | None, str | None]:
+    """Obtiene una tarea de Notion directamente por su ID."""
+    try:
+        page = notion.pages.retrieve(page_id=task_id)
+        title_prop = page.get("properties", {}).get("Nombre de tarea", {}).get("title", [])
+        if title_prop and title_prop[0].get("plain_text"):
+            return task_id, title_prop[0]["plain_text"]
+    except Exception as e:
+        logging.error(f"Error al obtener tarea por ID {task_id}: {e}")
+    return None, None
 
 # --- Funciones de Búsqueda de Tareas Mejorada ---
 
@@ -44,53 +94,74 @@ def normalize_title(title: str) -> str:
     title = title.translate(str.maketrans('', '', string.punctuation))
     return " ".join(title.split())
 
-def find_task_by_title_enhanced(notion: NotionClient, db_id: str, title_to_find: str) -> tuple[str | None, str | None]:
+def find_task_by_title_enhanced(notion: NotionClient, db_id: str, title_to_find: str) -> tuple[str | None, str | None, str | None]:
     """
-    Busca una tarea en Notion con una lógica mejorada:
-    1. Coincidencia exacta (normalizada)
-    2. Búsqueda por subcadena (normalizada)
-    3. Búsqueda por similitud (fuzzy matching)
-    Devuelve (task_id, real_title) o (None, None).
+    Busca una tarea en Notion con una lógica de búsqueda por niveles para la mejor experiencia de usuario.
+
+    El rendimiento es adecuado para bases de datos personales (cientos de tareas). Para miles de
+    tareas, este enfoque podría ser lento, ya que Notion no permite búsquedas normalizadas
+    (insensibles a mayúsculas/minúsculas y tildes) a través de su API.
+
+    Niveles de búsqueda:
+    0. Búsqueda por Alias: La más rápida y personalizada.
+    1. Coincidencia exacta (normalizada): La más precisa.
+    2. Búsqueda por subcadena (normalizada): Permite encontrar 'pase gol' dentro de 'Ir a Pasegol en PV...'.
+    3. Búsqueda por similitud (fuzzy matching): Atrapa errores de tipeo.
+
+    Devuelve una tupla con (task_id, real_title, search_method) o (None, None, None).
+    El `search_method` indica cómo se encontró la tarea, para poder decidir si se ofrece guardar un alias.
     """
     try:
         norm_title_to_find = normalize_title(title_to_find)
+        if not norm_title_to_find:
+            return None, None, None
+
+        # --- Nivel 0: Búsqueda por Alias ---
+        task_id = find_task_id_by_alias(norm_title_to_find)
+        if task_id:
+            # Si encontramos un alias, vamos directamente a por la tarea por su ID.
+            found_id, real_title = get_task_by_id(notion, task_id)
+            if found_id:
+                return found_id, real_title, "alias"
+
         response = notion.databases.query(database_id=db_id)
-        all_tasks = response.get("results", [])
         
+        # Pre-procesa todas las tareas una sola vez para eficiencia y claridad
         tasks_data = []
-        for p in all_tasks:
-            title_prop = p.get("properties", {}).get("Nombre de tarea", {}).get("title", [])
-            if title_prop:
+        for page in response.get("results", []):
+            title_prop = page.get("properties", {}).get("Nombre de tarea", {}).get("title", [])
+            if title_prop and title_prop[0].get("plain_text"):
                 real_title = title_prop[0]["plain_text"]
                 tasks_data.append({
-                    "id": p["id"],
+                    "id": page["id"],
                     "real_title": real_title,
                     "norm_title": normalize_title(real_title)
                 })
 
-        # 1. Búsqueda por coincidencia exacta
+        # --- Nivel 1: Búsqueda por coincidencia exacta ---
         for task in tasks_data:
             if norm_title_to_find == task["norm_title"]:
-                return task["id"], task["real_title"]
+                return task["id"], task["real_title"], "exact"
 
-        # 2. Búsqueda por subcadena
+        # --- Nivel 2: Búsqueda por subcadena ---
         for task in tasks_data:
             if norm_title_to_find in task["norm_title"]:
-                return task["id"], task["real_title"]
+                return task["id"], task["real_title"], "substring"
 
-        # 3. Búsqueda por similitud
-        norm_task_titles = [task["norm_title"] for task in tasks_data]
-        matches = get_close_matches(norm_title_to_find, norm_task_titles, n=1, cutoff=0.6)
+        # --- Nivel 3: Búsqueda por similitud (fuzzy) ---
+        all_norm_titles = [task["norm_title"] for task in tasks_data]
+        matches = get_close_matches(norm_title_to_find, all_norm_titles, n=1, cutoff=0.6)
         if matches:
             match_title = matches[0]
-            for task in tasks_data:
-                if task["norm_title"] == match_title:
-                    return task["id"], task["real_title"]
+            # Encontrar el objeto de tarea completo que corresponde al título coincidente
+            matched_task = next((task for task in tasks_data if task["norm_title"] == match_title), None)
+            if matched_task:
+                return matched_task["id"], matched_task["real_title"], "fuzzy"
                     
-        return None, None
+        return None, None, None
     except Exception as e:
         logging.error(f"Error en find_task_by_title_enhanced: {e}")
-        return None, None
+        return None, None, None
 
 # --- Funciones de Recordatorios ---
 
@@ -99,14 +170,18 @@ def set_reminder_db(chat_id: int, task_title: str, due_date: str, reminder_str: 
     Parsea la petición de recordatorio y la guarda en la BD.
     Ej: reminder_str = "30 minutos antes"
     """
-    # Parsear el tiempo del recordatorio
-    match = re.search(r"(\d+)\s*(minuto|hora|dia)s?", reminder_str, re.IGNORECASE)
+    # Parsear el tiempo del recordatorio, ahora acepta 'dia' o 'día'
+    match = re.search(r"(\d+)\s*(minuto|hora|d[ií]a)s?", reminder_str, re.IGNORECASE)
     if not match:
         return "No entendí el formato del recordatorio. Prueba con '30 minutos antes', '1 hora antes', etc."
 
     value = int(match.group(1))
     unit = match.group(2).lower()
     
+    # Normalizar la unidad para que 'día' funcione con timedelta
+    if 'd' in unit:
+        unit = 'dia'
+        
     delta_map = {"minuto": "minutes", "hora": "hours", "dia": "days"}
     delta = timedelta(**{delta_map[unit]: value})
 
