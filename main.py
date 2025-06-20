@@ -1,5 +1,7 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import utils
+import nest_asyncio
+import string
+import re
+import sys
 import os
 import json
 import openai
@@ -9,15 +11,15 @@ from datetime import datetime, date
 import dateparser
 import asyncio
 from difflib import get_close_matches
-import nest_asyncio
 import logging
 from unidecode import unidecode
-import string
-import re
-import sys
 
 # Importar la función de búsqueda mejorada desde utils
 from utils import find_task_by_title_enhanced, set_reminder_db, init_db, check_reminders
+
+# Aplicar el parche para permitir bucles de eventos anidados.
+# Esto es CRUCIAL para que APScheduler y python-telegram-bot coexistan.
+nest_asyncio.apply()
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
