@@ -437,233 +437,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"¡Hola! Soy Olivia, tu asistente para Notion. ¿En qué puedo ayudarte hoy?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+    """
+    Manejador principal de mensajes. Determina si el mensaje es una respuesta
+    a una pregunta anterior (contexto) o una nueva instrucción.
+    """
+    user_id = update.effective_user.id
+    user_input = update.message.text
     chat_id = update.message.chat_id
 
-    # 1. GESTIONAR RESPUESTAS CONTEXTUALES (CRUCIAL PARA APRENDIZAJE Y CONFIRMACIONES)
-    user_context = USER_CONTEXT.get(chat_id)
-    if user_context:
-        last_intent = user_context.get("last_intent")
+    # --- 1. GESTIÓN DE CONVERSACIONES CON CONTEXTO ---
+    # Si el bot está esperando una respuesta del usuario a una pregunta específica
+    if user_id in USER_CONTEXT:
+        context_type, data = USER_CONTEXT[user_id]
         
-        # --- Flujo de confirmación de creación de tarea ---
-        if last_intent == "confirm_creation":
-            if user_text.lower() in ["sí, crear", "si, crear", "si", "crear"]:
-                task_data = user_context["data"]
-                try:
-                    # Se crea la tarea sin la verificación de similitud esta vez
-                    notion.pages.create(
-                        parent={"database_id": NOTION_DATABASE_ID},
-                        properties={
-                            "Nombre de tarea": {"title": [{"text": {"content": task_data["title"]}}]},
-                            "Etiquetas": {"multi_select": [{"name": task_data["category"]}]},
-                            "Fecha límite": {"date": {"start": task_data["due_date"]}},
-                            "Descripción": {"rich_text": [{"text": {"content": task_data.get("description", "")}}]},
-                            "Estado": {"status": {"name": "Por hacer"}}
-                        }
-                    )
-                    await update.message.reply_text(f"✅ ¡Nueva tarea creada con éxito!")
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Error al crear la tarea: {e}")
+        # Eliminar el contexto para que el siguiente mensaje sea tratado como una nueva instrucción
+        del USER_CONTEXT[user_id]
+
+        # ---- Contexto: Confirmar la creación de una tarea duplicada ----
+        if context_type == 'confirm_creation':
+            # El usuario debe confirmar explícitamente para evitar duplicados
+            if re.search(r"\bsi\b|s[ií], crear|crear", user_input, re.IGNORECASE):
+                # Reintentar la creación, esta vez forzándola
+                await create_task_handler(context, chat_id, force_create=True, **data['task_info'])
             else:
-                await update.message.reply_text("Creación de tarea cancelada.")
-            USER_CONTEXT.pop(chat_id, None)
-            return
+                await update.message.reply_text("Ok, cancelo la creación de la tarea.")
 
-        # --- Flujo de aprendizaje de alias ---
-        elif last_intent == "confirm_alias":
-            context_data = user_context["data"]
-            original_intent = context_data["original_intent"]
-            task_id = context_data["task_id"]
-            real_title = context_data["real_title"]
-            potential_alias = context_data["potential_alias"]
-
-            feedback_msg = ""
-            if user_text.lower() in ["si", "sí", "yes", "ok", "vale", "guárdalo"]:
-                utils.add_alias(potential_alias, task_id)
-                feedback_msg = f"👍 ¡Entendido! He guardado '{potential_alias}' como un atajo.\n\n"
+        # ---- Contexto: Confirmar si se guarda un alias para una tarea ----
+        elif context_type == 'confirm_alias':
+            normalized_input = normalize_title(user_input)
+            if 'si' in normalized_input.split():
+                # El usuario dijo sí, guardamos el alias
+                task_id = data['task_id']
+                alias_text = data['alias_text']
+                real_title = data['real_title']
+                
+                add_alias(alias_text, task_id)
+                await update.message.reply_text(f"¡Hecho! He guardado '{alias_text}' como un atajo para '{real_title}'.")
+                
+                # Ahora que el alias está guardado, procedemos con la acción original (ej: completar la tarea)
+                original_intent = data['original_intent']
+                await edit_task_properties_handler(context, chat_id, task_id=task_id, **original_intent)
             else:
-                feedback_msg = "OK. No guardaré el atajo esta vez.\n\n"
-            
-            # Ejecutar la acción original que se había pausado
-            result = {}
-            if original_intent["action"] == "update_task":
-                 result = edit_task_properties(
-                    task_id=task_id, 
-                    new_status=original_intent.get("new_status"),
-                    new_due_date=original_intent.get("new_due_date"),
-                    new_category=original_intent.get("new_category")
-                )
-                 if result.get("status") == "success":
-                     await update.message.reply_text(f"{feedback_msg}✅ ¡Tarea '{real_title}' actualizada!")
-                 else:
-                     await update.message.reply_text(f"{feedback_msg}❌ Error al actualizar: {result.get('message')}")
-            
-            USER_CONTEXT.pop(chat_id, None)
-            return
+                # El usuario dijo no (o cualquier otra cosa), no guardamos el alias pero sí completamos la acción
+                await update.message.reply_text("Entendido. No guardaré el atajo, pero procederé con la acción solicitada.")
+                original_intent = data['original_intent']
+                task_id = data['task_id']
+                await edit_task_properties_handler(context, chat_id, task_id=task_id, **original_intent)
+        
+        return # Importante: terminamos el procesamiento aquí
 
-    # 2. SI NO HAY CONTEXTO, INTERPRETAR CON OPENAI
-    if 'history' not in context.user_data:
-        context.user_data['history'] = []
-
-    add_to_history(context.user_data['history'], "user", user_text)
-
+    # --- 2. GESTIÓN DE NUEVAS INSTRUCCIONES (SIN CONTEXTO) ---
+    # Si no hay contexto, usamos OpenAI para interpretar la instrucción
     try:
-        # Llamada a OpenAI para interpretar la intención del usuario
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *context.user_data["history"],
-                # Se corrige user_input por user_text
-                {"role": "user", "content": f"Basado en el historial y la nueva petición '{user_text}', determina la acción a realizar. Responde en formato JSON."}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
-        intent_json = json.loads(response.choices[0].message.content)
-        
-        # Guardar la respuesta de la IA en el historial
-        add_to_history(context.user_data['history'], "assistant", json.dumps(intent_json))
-        
-        # Limitar el historial a las últimas 10 interacciones para no exceder el límite de tokens
-        context.user_data['history'] = context.user_data['history'][-10:]
+        # Extraer índice de tarea si el usuario usa "la primera", "tarea 2", etc.
+        idx = extract_task_index(user_input)
+        if idx is not None and user_id in LAST_TASKS_LIST:
+            tasks = LAST_TASKS_LIST[user_id]
+            if 0 <= idx < len(tasks):
+                task = tasks[idx]
+                user_input = user_input.replace(user_input.split()[0], "").strip()
+                user_input += f" sobre la tarea '{task['title']}'"
 
-        intent = intent_json.get("action", "unknown")
-        params = intent_json.get("parameters", {})
+        response_json = get_openai_response(user_input, chat_id)
+        action = response_json.get("action")
+        params = response_json.get("parameters", {})
 
-        # 3. Ejecutar la acción correspondiente
-        # --- CREAR TAREA ---
-        if intent == "create_task":
-            result = create_task_notion(
-                title=params.get("title"),
-                description=params.get("description"),
-                category=params.get("category"),
-                due_date=params.get("due_date")
-            )
-            if result["status"] == "success":
-                await update.message.reply_text(f"✅ ¡Tarea creada! Título: {result['title']}")
-                 # Preguntar por recordatorio si hay fecha
-                if result.get("due_date"):
-                    USER_CONTEXT[chat_id] = {"last_intent": "ask_reminder", "data": {"title": result["title"], "due_date": result["due_date"]}}
-                    await update.message.reply_text("¿Quieres que te ponga un recordatorio para esta tarea? (ej: 'sí, 30 minutos antes')")
-            elif result["status"] == "confirm_creation":
-                await update.message.reply_text(result["message"])
-                task_data = {
-                    "title": params.get("title"),
-                    "description": params.get("description", ""),
-                    "category": normalize_category(params.get("category")),
-                    "due_date": normalize_date(params.get("due_date")),
-                }
-                USER_CONTEXT[chat_id] = {"last_intent": "confirm_creation", "data": task_data}
-            else:
-                await update.message.reply_text(f"❌ Error: {result['message']}")
-        
-        # --- GESTIONAR RECORDATORIOS ---
-        elif USER_CONTEXT.get(chat_id) and USER_CONTEXT[chat_id].get("last_intent") == "ask_reminder":
-            if user_text.lower().startswith("si") or user_text.lower().startswith("sí"):
-                reminder_str = user_text
-                task_data = USER_CONTEXT[chat_id]["data"]
-                result_msg = set_reminder_db(chat_id, task_data["title"], task_data["due_date"], reminder_str)
-                await update.message.reply_text(f"👍 {result_msg}")
-            else:
-                await update.message.reply_text("OK, no crearé un recordatorio.")
-            USER_CONTEXT.pop(chat_id, None)
-
-        # --- LISTAR TAREAS ---
-        elif intent == "list_tasks":
-            tasks = list_tasks_notion(
-                category=params.get("category"),
-                status=params.get("status") or "Por hacer"
-            )
-            if isinstance(tasks, list):
-                if not tasks:
-                    await update.message.reply_text("¡No tienes tareas pendientes que coincidan con tu búsqueda! 🎉")
-                else:
-                    # Guardar la lista de tareas en memoria para la paginación
-                    LAST_TASKS_LIST[chat_id] = tasks
-                    keyboard = create_task_keyboard(tasks, page=0)
-                    await update.message.reply_text("Aquí están tus tareas pendientes. ¡Puedes completarlas directamente desde aquí!", reply_markup=keyboard)
-            else:
-                await update.message.reply_text(f"❌ Error al listar tareas: {tasks.get('message')}")
-
-        # --- ACTUALIZAR TAREA ---
-        elif intent == "update_task":
-            title_to_find = params.get("title")
-            new_status = params.get("new_status")
-            new_due_date = params.get("new_due_date")
-            new_category = params.get("new_category")
-            task_index = extract_task_index(user_text)
-            task_id = None
-            
-            # Si el usuario usa un índice (ej. "la segunda tarea")
-            if task_index is not None and chat_id in LAST_TASKS_LIST:
-                if 0 <= task_index < len(LAST_TASKS_LIST[chat_id]):
-                    task_id = LAST_TASKS_LIST[chat_id][task_index]["id"]
-                    title_to_find = LAST_TASKS_LIST[chat_id][task_index]["title"] # Para el mensaje de confirmación
-            
-            result = edit_task_properties(task_id=task_id, title=title_to_find, 
-                                            new_status=new_status, new_due_date=new_due_date, new_category=new_category)
-            
-            if result["status"] == "success":
-                changes_list = []
-                if "Estado" in result["changes"]: changes_list.append(f"nuevo estado a '{result['changes']['Estado']['status']['name']}'")
-                if "Fecha límite" in result["changes"]: changes_list.append(f"nueva fecha a '{result['changes']['Fecha límite']['date']['start']}'")
-                if "Etiquetas" in result["changes"]: changes_list.append(f"nueva categoría a '{result['changes']['Etiquetas']['multi_select'][0]['name']}'")
-                await update.message.reply_text(f"✅ ¡Tarea '{result['title']}' actualizada! Se estableció {', '.join(changes_list)}.")
-            elif result["status"] == "confirm_alias":
-                USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(f"❌ Error: {result['message']}")
-
-        # --- ESTABLECER RECORDATORIO ---
-        elif intent == "set_reminder":
-            title_to_find = params.get("title")
-            reminder_str = params.get("reminder_str")
-            task_index = extract_task_index(user_text)
-            task_id = None
-
-            if task_index is not None and chat_id in LAST_TASKS_LIST:
-                if 0 <= task_index < len(LAST_TASKS_LIST[chat_id]):
-                    task_id = LAST_TASKS_LIST[chat_id][task_index]["id"]
-                    title_to_find = LAST_TASKS_LIST[chat_id][task_index]["title"]
-            
-            result = set_reminder_for_task(chat_id=chat_id, task_id=task_id, title=title_to_find, reminder_str=reminder_str)
-            if result["status"] == "success":
-                await update.message.reply_text(f"👍 {result['message']}")
-            elif result["status"] == "confirm_alias":
-                USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(f"❌ Error: {result['message']}")
-
-        # --- ELIMINAR TAREA ---
-        elif intent == "delete_task":
-            title_to_find = params.get("title")
-            task_index = extract_task_index(user_text)
-            task_id = None
-            
-            if task_index is not None and chat_id in LAST_TASKS_LIST:
-                if 0 <= task_index < len(LAST_TASKS_LIST[chat_id]):
-                    task_id = LAST_TASKS_LIST[chat_id][task_index]["id"]
-                    title_to_find = LAST_TASKS_LIST[chat_id][task_index]["title"]
-            
-            result = delete_task_notion(task_id=task_id, title=title_to_find)
-            if result["status"] == "success":
-                await update.message.reply_text(f"🗑️ ¡Tarea '{result['title']}' archivada con éxito!")
-            elif result["status"] == "confirm_alias":
-                USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(f"❌ Error: {result['message']}")
-            
-        # --- INTENCIÓN DESCONOCIDA ---
-        else:
-            await update.message.reply_text("No estoy segura de cómo ayudarte con eso. Puedo crear, listar, actualizar o borrar tareas.")
+        # Seleccionar el manejador de acción adecuado
+        if action == "create_task":
+            await create_task_handler(context, chat_id, **params)
+        elif action == "list_tasks":
+            await list_tasks_handler(context, chat_id, **params)
+        elif action == "update_task":
+            await edit_task_properties_handler(context, chat_id, **params)
+        elif action == "delete_task":
+            await delete_task_handler(context, chat_id, **params)
+        elif action == "set_reminder":
+            await set_reminder_handler(context, chat_id, **params)
+        else: # 'unknown'
+            await unknown_handler(context, chat_id, user_input)
 
     except Exception as e:
-        logging.error(f"Error al procesar el mensaje: {e}")
-        await update.message.reply_text("Lo siento, no pude procesar tu solicitud. Intenta de nuevo más tarde.")
+        logging.error(f"Error en handle_message: {e}")
+        await update.message.reply_text("Lo siento, ocurrió un error inesperado al procesar tu solicitud.")
 
 # -----------------------------------------------------------------------------
 # 7. TAREAS PROGRAMADAS Y COMANDOS ESPECIALES
@@ -684,7 +539,7 @@ async def generate_and_send_briefing(application: Application, chat_id: int):
     
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Eres un asistente de productividad. Resume la siguiente lista de tareas para hoy en un solo párrafo conciso y motivador. Responde en formato JSON con una clave 'briefing'."},
                 {"role": "user", "content": f"Tareas para hoy ({date.today().strftime('%d de %B')}): {task_list_str}"}
