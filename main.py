@@ -14,6 +14,7 @@ import logging
 from unidecode import unidecode
 import string
 import re
+import sys
 
 # Importar la función de búsqueda mejorada desde utils
 from utils import find_task_by_title_enhanced, set_reminder_db, init_db, check_reminders
@@ -779,17 +780,17 @@ async def send_daily_briefing(application: Application):
         logging.error(f"Error al generar o enviar el briefing diario: {e}")
 
 async def run_telegram_bot():
-    """Inicializa y corre el bot de Telegram."""
+    """Inicializa y corre el bot de Telegram, adaptándose al entorno (polling o webhook)."""
     nest_asyncio.apply()
     
-    # Inicializar la BD de recordatorios
+    # Inicializar la BD
     init_db()
 
-    # Configurar el scheduler para recordatorios y briefings
+    # Configurar el scheduler
     scheduler = AsyncIOScheduler()
-    
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # --- Jobs Programados ---
     # Job para recordatorios (cada minuto)
     scheduler.add_job(check_reminders, 'interval', minutes=1, args=[application])
     
@@ -802,16 +803,39 @@ async def run_telegram_bot():
         except ValueError:
             logging.error(f"El formato de BRIEFING_TIME ('{BRIEFING_TIME}') no es válido. Debe ser HH:MM.")
 
-    # Handlers
+    # --- Handlers ---
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    logging.info("Bot de Telegram iniciado...")
-    try:
-        await application.run_polling()
-    finally:
-        scheduler.shutdown()
+    # --- Lógica de Arranque (Webhook vs. Polling) ---
+    webhook_url = os.getenv("WEBHOOK_URL")
+    port = int(os.getenv("PORT", 8080))
+
+    if webhook_url:
+        # Modo Webhook (para producción en Render)
+        await application.bot.set_webhook(url=webhook_url)
+        logging.info(f"Bot iniciado en modo WEBHOOK en el puerto {port}")
+        scheduler.start()
+        try:
+            await application.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                webhook_url=webhook_url
+            )
+        finally:
+            scheduler.shutdown()
+            await application.bot.delete_webhook()
+            logging.info("Webhook eliminado y scheduler detenido.")
+    else:
+        # Modo Polling (para desarrollo local)
+        logging.info("Bot iniciado en modo POLLING")
+        scheduler.start()
+        try:
+            await application.run_polling()
+        finally:
+            scheduler.shutdown()
+            logging.info("Polling detenido y scheduler detenido.")
 
 def run_cli():
     """Ejecuta el asistente en modo línea de comandos para pruebas."""
