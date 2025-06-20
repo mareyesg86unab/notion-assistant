@@ -506,6 +506,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error en handle_message: {e}")
         await update.message.reply_text("Lo siento, ocurrió un error inesperado al procesar tu solicitud.")
 
+async def create_task_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, force_create=False, **params):
+    """Manejador para la acción de crear tareas."""
+    title = params.get("title")
+    if not title:
+        await context.bot.send_message(chat_id, "Necesito al menos un título para crear la tarea.")
+        return
+
+    # Si no estamos forzando la creación, primero verificamos si existe una tarea similar.
+    if not force_create:
+        _, similar_title, _ = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
+        if similar_title:
+            # Encontramos un duplicado potencial. Guardamos el contexto y preguntamos al usuario.
+            user_id = chat_id # Asumimos que el user_id es el chat_id en chats privados
+            USER_CONTEXT[user_id] = (
+                'confirm_creation',
+                {'task_info': params}
+            )
+            await context.bot.send_message(chat_id, f"⚠️ Ya existe una tarea similar llamada '{similar_title}'.\n\n¿Seguro que quieres crear una nueva llamada '{title}'?\nResponde 'Sí, crear' para confirmar.")
+            return
+
+    # Procedemos a crear la tarea (ya sea porque no había duplicados o porque el usuario confirmó)
+    result = create_task_notion(**params)
+    message = result.get("message", "No se pudo obtener un mensaje de estado.")
+    await context.bot.send_message(chat_id, message)
+
+async def list_tasks_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **params):
+    """Manejador para la acción de listar tareas."""
+    status = params.get("status") or "Por hacer" # Default to 'Por hacer'
+    category = params.get("category")
+
+    tasks = list_tasks_notion(category=category, status=status)
+    
+    if isinstance(tasks, dict) and tasks.get("status") == "error":
+        await context.bot.send_message(chat_id, tasks["message"])
+        return
+    
+    if not tasks:
+        await context.bot.send_message(chat_id, "¡Felicidades! No hay tareas pendientes que coincidan con tu búsqueda.")
+        return
+
+    # Guardar la lista para poder referenciarla por índice ("completa la primera")
+    user_id = chat_id
+    LAST_TASKS_LIST[user_id] = tasks
+
+    keyboard = create_task_keyboard(tasks)
+    await context.bot.send_message(chat_id, "Aquí tienes tus tareas:", reply_markup=keyboard)
+
 async def edit_task_properties_handler(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **params):
     """Manejador para la acción de editar propiedades de una tarea."""
     task_id = params.get("task_id")
