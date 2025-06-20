@@ -1,3 +1,5 @@
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import utils
 import os
 import json
 import openai
@@ -108,10 +110,9 @@ def normalize_title(title: str) -> str:
     return title
 
 def find_task_id_by_title(title: str) -> tuple[str | None, str | None]:
-    """
-    Busca el ID de la tarea por título exacto o aproximado (normalizado).
-    Devuelve (id, nombre_real) si encuentra, o (None, None) si no.
-    """
+        """Wrapper para la función de búsqueda mejorada."""
+        return utils.find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
+   
     try:
         norm_title = normalize_title(title)
         # Buscar coincidencia exacta (normalizada)
@@ -300,6 +301,18 @@ functions = [
                 "task_id": {"type": "string", "description": "El ID de la tarea a eliminar."},
                 "title": {"type": "string", "description": "El título de la tarea a eliminar."}
             }
+        }
+     },
+    {
+        "name": "set_reminder",
+        "description": "Configura un recordatorio para una tarea existente. El usuario debe especificar cuánto tiempo antes de la fecha límite.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "El título de la tarea para la cual se configura el recordatorio."},
+                "reminder_str": {"type": "string", "description": "Descripción del tiempo para el recordatorio, ej: '30 minutos antes', '1 hora antes', '2 dias antes'."}
+            },
+            "required": ["title", "reminder_str"]
         }
     }
 ]
