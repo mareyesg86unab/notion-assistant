@@ -736,9 +736,8 @@ async def generate_and_send_briefing(application: Application, chat_id: int):
         logging.error(f"Error al generar briefing con OpenAI: {e}")
         await application.bot.send_message(chat_id=chat_id, text="Tuve problemas para generar el resumen de hoy, pero estas son tus tareas pendientes:\n\n" + task_list_str)
 
-async def scheduled_briefing(context: ContextTypes.DEFAULT_TYPE):
-    """Tarea programada que llama a la función de briefing."""
-    application = context.application
+async def scheduled_briefing(application: Application):
+    """Tarea programada que llama a la función de briefing. Ahora recibe 'application' directamente."""
     await generate_and_send_briefing(application, TELEGRAM_CHAT_ID)
 
 async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -753,22 +752,24 @@ async def run_telegram_bot():
     """Configura y corre el bot de Telegram."""
     init_db()
 
+    # Se crea la aplicación ANTES para poder pasarla a los jobs del scheduler.
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
     # Configura el scheduler para los recordatorios y el briefing
     scheduler = AsyncIOScheduler(timezone="America/Santiago")
-    scheduler.add_job(check_reminders, "interval", minutes=1)
+    
+    # CORRECCIÓN: Se pasa 'application' como argumento a los jobs.
+    scheduler.add_job(check_reminders, "interval", minutes=1, args=[application])
     
     # Tarea programada para el briefing diario
     if BRIEFING_TIME and TELEGRAM_CHAT_ID:
         try:
             hour, minute = map(int, BRIEFING_TIME.split(':'))
-            scheduler.add_job(scheduled_briefing, "cron", hour=hour, minute=minute)
+            scheduler.add_job(scheduled_briefing, "cron", hour=hour, minute=minute, args=[application])
             logging.info(f"Briefing diario programado para las {BRIEFING_TIME} todos los días.")
         except ValueError:
             logging.error("Formato de BRIEFING_TIME incorrecto. Debe ser HH:MM.")
 
-    # Crea la aplicación de Telegram
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
     # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("briefing", briefing_command)) # Handler para /briefing
