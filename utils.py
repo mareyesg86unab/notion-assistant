@@ -97,66 +97,58 @@ def normalize_title(title: str) -> str:
 def find_task_by_title_enhanced(notion: NotionClient, db_id: str, title_to_find: str) -> tuple[str | None, str | None, str | None]:
     """
     Busca una tarea en Notion con una lógica de búsqueda por niveles para la mejor experiencia de usuario.
-
-    El rendimiento es adecuado para bases de datos personales (cientos de tareas). Para miles de
-    tareas, este enfoque podría ser lento, ya que Notion no permite búsquedas normalizadas
-    (insensibles a mayúsculas/minúsculas y tildes) a través de su API.
-
     Niveles de búsqueda:
-    0. Búsqueda por Alias: La más rápida y personalizada.
-    1. Coincidencia exacta (normalizada): La más precisa.
-    2. Búsqueda por subcadena (normalizada): Permite encontrar 'pase gol' dentro de 'Ir a Pasegol en PV...'.
-    3. Búsqueda por similitud (fuzzy matching): Atrapa errores de tipeo.
-
-    Devuelve una tupla con (task_id, real_title, search_method) o (None, None, None).
-    El `search_method` indica cómo se encontró la tarea, para poder decidir si se ofrece guardar un alias.
+    1. Búsqueda por Alias: La más rápida y personalizada.
+    2. Búsqueda por Relevancia: Calcula un puntaje para cada tarea y elige la mejor.
     """
     try:
         norm_title_to_find = normalize_title(title_to_find)
         if not norm_title_to_find:
             return None, None, None
 
-        # --- Nivel 0: Búsqueda por Alias ---
+        # --- Nivel 1: Búsqueda por Alias ---
         task_id = find_task_id_by_alias(norm_title_to_find)
         if task_id:
-            # Si encontramos un alias, vamos directamente a por la tarea por su ID.
             found_id, real_title = get_task_by_id(notion, task_id)
             if found_id:
                 return found_id, real_title, "alias"
 
-        response = notion.databases.query(database_id=db_id)
+        # --- Nivel 2: Búsqueda por Relevancia ---
+        response = notion.databases.query(database_id=db_id, filter={"property": "Estado", "status": {"does_not_equal": "Hecho"}})
         
-        # Pre-procesa todas las tareas una sola vez para eficiencia y claridad
-        tasks_data = []
+        best_match = {"id": None, "title": None, "score": 0}
+        
+        search_words = set(norm_title_to_find.split())
+
         for page in response.get("results", []):
             title_prop = page.get("properties", {}).get("Nombre de tarea", {}).get("title", [])
-            if title_prop and title_prop[0].get("plain_text"):
-                real_title = title_prop[0]["plain_text"]
-                tasks_data.append({
-                    "id": page["id"],
-                    "real_title": real_title,
-                    "norm_title": normalize_title(real_title)
-                })
+            if not (title_prop and title_prop[0].get("plain_text")):
+                continue
 
-        # --- Nivel 1: Búsqueda por coincidencia exacta ---
-        for task in tasks_data:
-            if norm_title_to_find == task["norm_title"]:
-                return task["id"], task["real_title"], "exact"
+            real_title = title_prop[0]["plain_text"]
+            norm_title = normalize_title(real_title)
+            
+            # Calcular puntaje de relevancia
+            # a) Coincidencia de palabras clave
+            title_words = set(norm_title.split())
+            common_words = search_words.intersection(title_words)
+            keyword_score = len(common_words)
+            
+            # b) Similitud general (difflib)
+            similarity_score = get_close_matches(norm_title_to_find, [norm_title], n=1, cutoff=0.6)
+            
+            # El puntaje total es una combinación. Le damos más peso a las palabras clave.
+            total_score = (keyword_score * 2) + (1 if similarity_score else 0)
 
-        # --- Nivel 2: Búsqueda por subcadena ---
-        for task in tasks_data:
-            if norm_title_to_find in task["norm_title"]:
-                return task["id"], task["real_title"], "substring"
+            if total_score > best_match["score"]:
+                best_match = {"id": page["id"], "title": real_title, "score": total_score}
 
-        # --- Nivel 3: Búsqueda por similitud (fuzzy) ---
-        all_norm_titles = [task["norm_title"] for task in tasks_data]
-        matches = get_close_matches(norm_title_to_find, all_norm_titles, n=1, cutoff=0.6)
-        if matches:
-            match_title = matches[0]
-            # Encontrar el objeto de tarea completo que corresponde al título coincidente
-            matched_task = next((task for task in tasks_data if task["norm_title"] == match_title), None)
-            if matched_task:
-                return matched_task["id"], matched_task["real_title"], "fuzzy"
+        if best_match["id"]:
+            # Determinamos si fue una coincidencia "exacta" o "aproximada" (fuzzy)
+            # para decidir si ofrecemos guardar un alias.
+            is_exact_match = normalize_title(best_match["title"]) == norm_title_to_find
+            search_method = "exact" if is_exact_match else "fuzzy"
+            return best_match["id"], best_match["title"], search_method
                     
         return None, None, None
     except Exception as e:
