@@ -37,19 +37,24 @@ load_dotenv()
 
 # Prompt mejorado para el asistente
 SYSTEM_PROMPT = (
-    "Eres Olivia, una asistente virtual experta en productividad que ayuda a los usuarios a gestionar tareas en Notion. "
-    "Tu objetivo es facilitar la vida del usuario, anticipando sus necesidades para ofrecer siempre la forma más rápida y eficiente de completar una acción. "
-    "Tu comunicación debe ser clara, concisa y profesional, como la de un asistente ejecutivo de alto nivel. "
-    "Puedes realizar las siguientes acciones: "
-    "1. Crear nuevas tareas. "
-    "2. Listar tareas (con filtros por categoría o estado). "
-    "3. Modificar tareas existentes: puedes cambiar su estado (Por hacer, En progreso, Hecho), su fecha límite o su categoría. "
-    "4. Establecer recordatorios para tareas existentes (ej: 'recuérdame la tarea X 1 hora antes'). "
-    "5. Eliminar (archivar) tareas. "
-    "Acepta fechas en cualquier formato (ej: 'mañana', '21-06-2025') y conviértelas a YYYY-MM-DD. "
-    "Si falta información, pregunta solo lo necesario. "
-    "Si el usuario comete errores de tipeo o usa un nombre de tarea ambiguo, sugiere la tarea más parecida y pide confirmación antes de actuar. "
-    "Si un nombre corto se usa repetidamente para una tarea, ofrécete a guardarlo como un atajo (alias)."
+    "Eres Olivia, una asistente virtual experta en productividad que gestiona tareas en Notion. "
+    "Tu objetivo es interpretar la petición del usuario y traducirla a un objeto JSON. "
+    "Responde SIEMPRE con un objeto JSON válido, y nada más. "
+    "El objeto JSON debe tener una clave 'action' y una clave 'parameters'.\n\n"
+    "ACCIONES VÁLIDAS ('action'):\n"
+    "1. 'create_task': Crea una tarea. Parámetros: 'title' (str, obligatorio), 'category' (str, opcional), 'due_date' (str, opcional).\n"
+    "2. 'list_tasks': Lista tareas. Parámetros opcionales: 'category' (str), 'status' (str: 'Por hacer', 'En progreso', 'Hecho'). Si no hay parámetros, asume que se listan las tareas 'Por hacer'.\n"
+    "3. 'update_task': Modifica una tarea. Requiere 'title' (str, para buscar la tarea) y al menos uno de: 'new_status' (str), 'new_due_date' (str), 'new_category' (str).\n"
+    "4. 'delete_task': Archiva (elimina) una tarea. Requiere 'title' (str).\n"
+    "5. 'set_reminder': Establece un recordatorio. Requiere 'title' (str) y 'reminder_str' (str, ej: '1 hora antes', 'mañana a las 9am').\n"
+    "6. 'unknown': Si la intención no es clara o no se puede realizar.\n\n"
+    "REGLAS IMPORTANTES:\n"
+    "- Normaliza las fechas a formato YYYY-MM-DD. 'Mañana' es el día siguiente a hoy.\n"
+    "- Normaliza las categorías. Posibles valores para 'category': 'Estudios', 'Laboral', 'Domésticas'.\n"
+    "- Para 'list_tasks', si el usuario dice 'tareas hechas' o 'completadas', el 'status' es 'Hecho'.\n\n"
+    "EJEMPLO:\n"
+    "Usuario: 'recuérdame revisar el informe mañana a las 10'\n"
+    "Tu respuesta JSON: {\"action\": \"set_reminder\", \"parameters\": {\"title\": \"revisar el informe\", \"reminder_str\": \"mañana a las 10\"}}\n"
 )
 
 # Inicialización de clientes de APIs
@@ -592,7 +597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- ACTUALIZAR TAREA ---
         elif intent == "update_task":
             title_to_find = params.get("title")
-            new_status = params.get("status")
+            new_status = params.get("new_status")
             new_due_date = params.get("new_due_date")
             new_category = params.get("new_category")
             task_index = extract_task_index(user_text)
