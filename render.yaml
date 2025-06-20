@@ -5,10 +5,6 @@ services:
     name: asistoliv
     env: python
 
-    # Fija la versión de Python a una estable y compatible (3.11)
-    # para evitar errores de incompatibilidad con las librerías del proyecto.
-    pythonVersion: "3.11"
-
     # Comando para instalar todas las dependencias antes de iniciar.
     buildCommand: "pip install -r requirements.txt"
 
@@ -18,6 +14,11 @@ services:
     # Definición de las variables de entorno.
     # Los secretos (tokens, API keys) se deben configurar en el dashboard de Render.
     envVars:
+      # Fija la versión de Python a una estable y compatible (3.11)
+      # para evitar errores de incompatibilidad con las librerías del proyecto.
+      - key: PYTHON_VERSION
+        value: "3.11"
+        
       # El puerto en el que la aplicación escuchará. Render lo necesita.
       - key: PORT
         value: 8080
