@@ -147,42 +147,56 @@ def extract_task_index(user_input: str) -> int | None:
         return int(m.group(1)) - 1
     return None
 
+def get_openai_response(user_input: str, chat_id: int) -> dict:
+    """Llama a la API de OpenAI para interpretar el texto del usuario y devolver un JSON con la acción."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Interpreta la siguiente petición del usuario en el contexto de gestión de tareas de Notion. Petición: '{user_input}'. Responde en formato JSON."}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logging.error(f"Error al llamar a OpenAI para el chat {chat_id}: {e}")
+        return {"action": "unknown", "parameters": {}}
+
 # -----------------------------------------------------------------------------
 # 3. LÓGICA DE INTERACCIÓN CON NOTION
 # -----------------------------------------------------------------------------
 
 def create_task_notion(**kwargs):
+    """Crea una tarea en Notion. Ahora no necesita verificar duplicados aquí."""
     title = kwargs.get("title")
     description = kwargs.get("description", "")
     raw_cat = kwargs.get("category", "")
     category = normalize_category(raw_cat)
     due_date = normalize_date(kwargs.get("due_date"))
 
-    if not category:
-        return {"status": "error", "message": f"La categoría '{raw_cat}' no es válida. Usa una de estas: {', '.join(VALID_CATEGORIES)}"}
-    if not due_date:
-        return {"status": "error", "message": f"La fecha '{kwargs.get('due_date')}' no es válida. Intenta con 'mañana', 'próximo viernes' o 'DD-MM-YYYY'."}
+    if not title:
+         return {"status": "error", "message": "El título es obligatorio para crear una tarea."}
 
-    # Antes de crear, verifica si existe una tarea similar
-    _, similar_title, _ = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
-    if similar_title:
-        return {
-            "status": "confirm_creation",
-            "message": f"Ya existe una tarea similar llamada '{similar_title}'. ¿Seguro que quieres crear una nueva tarea llamada '{title}'? Responde 'Sí, crear' para confirmar."
-        }
+    props_to_create = {
+        "Nombre de tarea": {"title": [{"text": {"content": title}}]},
+        "Estado": {"status": {"name": "Por hacer"}}
+    }
+    if category:
+        props_to_create["Etiquetas"] = {"multi_select": [{"name": category}]}
+    if due_date:
+        props_to_create["Fecha límite"] = {"date": {"start": due_date}}
+    if description:
+        props_to_create["Descripción"] = {"rich_text": [{"text": {"content": description}}]}
 
     try:
         notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "Nombre de tarea": {"title": [{"text": {"content": title}}]},
-                "Etiquetas": {"multi_select": [{"name": category}]},
-                "Fecha límite": {"date": {"start": due_date}},
-                "Descripción": {"rich_text": [{"text": {"content": description}}]},
-                "Estado": {"status": {"name": "Por hacer"}}
-            }
+            properties=props_to_create
         )
-        return {"status": "success", "action": "create_task", "title": title, "category": category, "due_date": due_date}
+        msg = f"✅ ¡Tarea '{title}' creada con éxito!"
+        return {"status": "success", "message": msg}
     except Exception as e:
         logging.error(f"Error al crear la tarea en Notion: {e}")
         return {"status": "error", "message": f"Error al crear la tarea en Notion: {e}"}
@@ -193,17 +207,19 @@ def list_tasks_notion(category=None, status=None):
         cat = normalize_category(category)
         if cat:
             filters.append({"property": "Etiquetas", "multi_select": {"contains": cat}})
+    
+    # Si no se especifica estado, por defecto no se filtra por estado (se muestran todas)
+    # excepto si explícitamente se pide un estado.
     if status:
         filters.append({"property": "Estado", "status": {"equals": status}})
 
     query = {"database_id": NOTION_DATABASE_ID}
     if filters:
+        # Si hay más de un filtro, los une con "and"
         query["filter"] = {"and": filters}
 
     try:
         response = notion.databases.query(**query)
-        if not response or not isinstance(response, dict):
-            return {"status": "error", "message": "No se pudo obtener respuesta válida de Notion. Verifica tu API key, permisos y el ID de la base de datos."}
         results = response.get("results", [])
         tasks = []
         for p in results:
@@ -220,91 +236,58 @@ def list_tasks_notion(category=None, status=None):
             })
         return tasks
     except Exception as e:
+        logging.error(f"Error al listar tareas de Notion: {e}")
         return {"status": "error", "message": f"Error al listar tareas: {e}"}
 
-def edit_task_properties(task_id: str = None, title: str = None, new_status: str = None, new_due_date: str = None, new_category: str = None):
+def edit_task_properties(task_id: str = None, **kwargs):
     """
     Edita una o varias propiedades de una tarea en Notion.
-    Esta es una función versátil que reemplaza a la antigua `update_task_notion`.
     """
-    if not task_id and title:
-        task_id, real_title, search_method = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
-        
-        if not task_id:
-            return {"status": "error", "message": f"Tarea '{title}' no encontrada."}
-        
-        # Oportunidad de aprendizaje: si se encontró de forma ambigua
-        if search_method in ["substring", "fuzzy"]:
-            original_intent = {
-                "action": "edit",
-                "new_status": new_status,
-                "new_due_date": new_due_date,
-                "new_category": new_category
-            }
-            # Filtra las claves que son None para no guardar datos innecesarios
-            original_intent = {k: v for k, v in original_intent.items() if v is not None}
-            
-            return {
-                "status": "confirm_alias",
-                "message": f"He encontrado la tarea '{real_title}'. ¿Te refieres a esa?",
-                "data": {
-                    "task_id": task_id,
-                    "real_title": real_title,
-                    "potential_alias": title,
-                    "original_intent": original_intent
-                }
-            }
-        title = real_title  # Usar el nombre real para feedback
-    
     if not task_id:
-        return {"status": "error", "message": "Se necesita el título o ID de la tarea para editarla."}
-        
+        return {"status": "error", "message": "Se requiere un ID de tarea para editar."}
+
     properties_to_update = {}
+    
+    new_status = kwargs.get("new_status")
+    new_due_date = kwargs.get("new_due_date")
+    new_category = kwargs.get("new_category")
+
     if new_status:
         properties_to_update["Estado"] = {"status": {"name": new_status}}
     if new_due_date:
         normalized_date = normalize_date(new_due_date)
-        if not normalized_date:
+        if normalized_date:
+            properties_to_update["Fecha límite"] = {"date": {"start": normalized_date}}
+        else:
             return {"status": "error", "message": f"La fecha '{new_due_date}' no es válida."}
-        properties_to_update["Fecha límite"] = {"date": {"start": normalized_date}}
     if new_category:
         normalized_cat = normalize_category(new_category)
-        if not normalized_cat:
+        if normalized_cat:
+            properties_to_update["Etiquetas"] = {"multi_select": [{"name": normalized_cat}]}
+        else:
             return {"status": "error", "message": f"La categoría '{new_category}' no es válida."}
-        properties_to_update["Etiquetas"] = {"multi_select": [{"name": normalized_cat}]}
-        
+            
     if not properties_to_update:
-        return {"status": "error", "message": "No has especificado qué quieres cambiar (estado, fecha o categoría)."}
+        return {"status": "info", "message": "No especificaste qué cambiar."}
 
     try:
         notion.pages.update(page_id=task_id, properties=properties_to_update)
-        return {"status": "success", "action": "edit", "title": title, "changes": properties_to_update}
+        # Generar un mensaje de éxito más descriptivo
+        updates_str = []
+        if new_status: updates_str.append(f"estado a '{new_status}'")
+        if new_due_date: updates_str.append(f"fecha a '{new_due_date}'")
+        if new_category: updates_str.append(f"categoría a '{new_category}'")
+        
+        task_info = notion.pages.retrieve(page_id=task_id)
+        task_title = task_info['properties']['Nombre de tarea']['title'][0]['plain_text']
+
+        return {"status": "success", "message": f"✅ Tarea '{task_title}' actualizada: " + ", ".join(updates_str) + "."}
     except Exception as e:
-        logging.error(f"Error al editar la tarea en Notion: {e}")
+        logging.error(f"Error al editar la tarea {task_id}: {e}")
         return {"status": "error", "message": f"Error al editar la tarea: {e}"}
 
-def set_reminder_for_task(chat_id: int, task_id: str = None, title: str = None, reminder_str: str = None):
+def set_reminder_for_task(chat_id: int, task_id: str, reminder_str: str):
     """Encuentra una tarea y establece un recordatorio para ella."""
-    if not task_id and title:
-        task_id, real_title, search_method = find_task_by_title_enhanced(notion, NOTION_DATABASE_ID, title)
-        
-        if not task_id:
-            return {"status": "error", "message": f"Tarea '{title}' no encontrada."}
-
-        # Oportunidad de aprendizaje
-        if search_method in ["substring", "fuzzy"]:
-            return {
-                "status": "confirm_alias",
-                "message": f"He encontrado la tarea '{real_title}'. ¿Te refieres a esa?",
-                "data": {
-                    "task_id": task_id,
-                    "real_title": real_title,
-                    "potential_alias": title,
-                    "original_intent": {"action": "set_reminder", "reminder_str": reminder_str}
-                }
-            }
-        title = real_title
-        
     if not task_id:
         return {"status": "error", "message": "Se necesita el título o ID de la tarea."}
         
@@ -312,10 +295,10 @@ def set_reminder_for_task(chat_id: int, task_id: str = None, title: str = None, 
         page = notion.pages.retrieve(page_id=task_id)
         due_date_prop = page.get("properties", {}).get("Fecha límite", {}).get("date")
         if not due_date_prop or not due_date_prop.get("start"):
-            return {"status": "error", "message": f"No puedo crear un recordatorio para '{title}' porque no tiene una fecha límite establecida."}
+            return {"status": "error", "message": f"No puedo crear un recordatorio para '{task_id}' porque no tiene una fecha límite establecida."}
         
         due_date = due_date_prop["start"]
-        result_msg = set_reminder_db(chat_id, title, due_date, reminder_str)
+        result_msg = set_reminder_db(chat_id, task_id, due_date, reminder_str)
         return {"status": "success", "message": result_msg}
 
     except Exception as e:
@@ -385,56 +368,50 @@ def create_task_keyboard(tasks: list, page: int = 0) -> InlineKeyboardMarkup:
 # -----------------------------------------------------------------------------
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los clics en los botones del teclado interactivo."""
+    """Maneja las pulsaciones de los botones de la botonera."""
     query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    action, *params = query.data.split('_')
+    await query.answer() # Confirmar que se recibió la pulsación
     
-    # Recuperar la lista de tareas de la memoria del bot
-    tasks = LAST_TASKS_LIST.get(chat_id, [])
-    if not tasks:
-        await query.edit_message_text("Esta lista de tareas ha expirado. Por favor, pídemela de nuevo con 'listar tareas'.")
-        return
-
-    if action == "page":
-        page = int(params[0])
-        keyboard = create_task_keyboard(tasks, page)
-        await query.edit_message_text(text="Aquí están tus tareas pendientes:", reply_markup=keyboard)
-
-    elif action == "complete":
-        page = int(params[0])
-        task_id = params[1]
-        
-        task_title = next((task['title'] for task in tasks if task['id'] == task_id), 'la tarea')
+    data = query.data
+    chat_id = query.effective_chat.id
+    user_id = query.effective_user.id
+    
+    # --- Paginación ---
+    if data.startswith("page_"):
+        page = int(data.split("_")[1])
+        if user_id in LAST_TASKS_LIST:
+            tasks = LAST_TASKS_LIST[user_id]
+            keyboard = create_task_keyboard(tasks, page)
+            await query.edit_message_text(text="Aquí tienes tus tareas:", reply_markup=keyboard)
+        else:
+            await query.edit_message_text(text="La lista de tareas ha expirado. Pide una nueva con /list.")
+    
+    # --- Completar Tarea ---
+    elif data.startswith("complete_"):
+        task_id = data.replace("complete_", "")
+        await query.edit_message_text(text=f"✅ Completando tarea...", reply_markup=None)
         
         result = edit_task_properties(task_id=task_id, new_status="Hecho")
         
-        if result.get("status") == "success":
-            # Actualizar la lista en memoria eliminando la tarea completada
-            updated_tasks = [task for task in tasks if task['id'] != task_id]
-            LAST_TASKS_LIST[chat_id] = updated_tasks
-            
-            # Recalcular la página actual por si era la última tarea de la página
-            total_pages = (len(updated_tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE
-            current_page = min(page, total_pages - 1)
-            
-            if not updated_tasks:
-                await query.edit_message_text(text=f"✅ ¡Excelente! Has completado '{task_title}'.\n\n¡No quedan más tareas pendientes en esta lista!")
+        message = result.get("message", "No se pudo obtener un mensaje de estado.")
+        await context.bot.send_message(chat_id, message)
+        
+        # Opcional: Refrescar la lista de tareas después de completar una
+        if user_id in LAST_TASKS_LIST:
+            # Eliminar la tarea completada de la lista en memoria
+            LAST_TASKS_LIST[user_id] = [t for t in LAST_TASKS_LIST[user_id] if t['id'] != task_id]
+            tasks = LAST_TASKS_LIST[user_id]
+            if tasks:
+                keyboard = create_task_keyboard(tasks, page=0) # Volver a la primera página
+                await context.bot.send_message(chat_id, "Tareas restantes:", reply_markup=keyboard)
             else:
-                keyboard = create_task_keyboard(updated_tasks, current_page)
-                await query.edit_message_text(text=f"✅ ¡Bien hecho! Has completado '{task_title}'.\n\nAquí está tu lista actualizada:", reply_markup=keyboard)
-        else:
-            # Si hay un error, no editar el mensaje, sino enviar uno nuevo para no perder el teclado
-            await query.message.reply_text(f"❌ No pude actualizar la tarea: {result.get('message', 'Error desconocido')}")
-
-def add_to_history(history, role, content):
-    """Añade una entrada al historial de conversación."""
-    history.append({"role": role, "content": content})
+                await context.bot.send_message(chat_id, "¡Felicidades, has completado todas las tareas de esta lista!")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"¡Hola! Soy Olivia, tu asistente para Notion. ¿En qué puedo ayudarte hoy?")
+    """Mensaje de bienvenida."""
+    await update.message.reply_text(
+        "¡Hola! Soy Olivia, tu asistente para Notion. ¿En qué puedo ayudarte hoy?"
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -495,8 +472,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks = LAST_TASKS_LIST[user_id]
             if 0 <= idx < len(tasks):
                 task = tasks[idx]
-                user_input = user_input.replace(user_input.split()[0], "").strip()
-                user_input += f" sobre la tarea '{task['title']}'"
+                # Modificamos el input para que OpenAI entienda a qué tarea nos referimos
+                # Ej: "complétala" -> "completa la tarea 'Hacer la compra'"
+                cleaned_input = re.sub(r"\b(la|el|una|un|primera|segunda|tercera|cuarta|quinta)\b", "", user_input, flags=re.IGNORECASE).strip()
+                user_input = f"{cleaned_input} de la tarea '{task['title']}'"
 
         response_json = get_openai_response(user_input, chat_id)
         action = response_json.get("action")
