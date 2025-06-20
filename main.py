@@ -53,9 +53,12 @@ SYSTEM_PROMPT = (
     "- Normaliza las categorías. Posibles valores para 'category': 'Estudios', 'Laboral', 'Domésticas'.\n"
     "- Para 'list_tasks', si el usuario dice 'tareas hechas' o 'completadas', el 'status' es 'Hecho'.\n\n"
     "EJEMPLO:\n"
-    "Usuario: 'recuérdame revisar el informe mañana a las 10'\n"
-    "Tu respuesta JSON: {\"action\": \"set_reminder\", \"parameters\": {\"title\": \"revisar el informe\", \"reminder_str\": \"mañana a las 10\"}}\n"
+    "Usuario: 'recuérdame revisar el informe mañana a las 10'\\n"
+    'Tu respuesta JSON: {"action": "set_reminder", "parameters": {"title": "revisar el informe", "reminder_str": "mañana a las 10"}}\\n'
 )
+
+# Diccionario para gestionar conversaciones contextuales (ej. confirmaciones)
+USER_CONTEXT = {}
 
 # Inicialización de clientes de APIs
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -446,56 +449,24 @@ def create_task_keyboard(tasks: list, page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los clics en los botones del teclado interactivo."""
     query = update.callback_query
-    await query.answer()  # Confirmar la recepción del clic
+    await query.answer()
+    
+    action, task_id = query.data.split(':')
 
-    chat_id = query.message.chat_id
-    action, *params = query.data.split('_')
-
-    if action == "noop":
-        return
-
-    tasks = LAST_TASKS_LIST.get(chat_id, [])
-    if not tasks:
-        await query.edit_message_text("Parece que tu lista de tareas ha expirado. Por favor, vuelve a listarlas.")
-        return
-
-    if action == "page":
-        page = int(params[0])
-        keyboard = create_task_keyboard(tasks, page)
-        await query.edit_message_text(text="Aquí están tus tareas:", reply_markup=keyboard)
-
-    elif action == "complete":
-        page = int(params[0])
-        task_id = params[1]
-        
-        task_title = next((task['title'] for task in tasks if task['id'] == task_id), 'la tarea')
-        
-        result = edit_task_properties(task_id=task_id, status="Hecho")
-        
+    if action == "complete_task":
+        # CORRECCIÓN: Usar 'new_status' en lugar de 'status' para que coincida con la firma de la función.
+        result = edit_task_properties(task_id=task_id, new_status="Hecho")
         if result.get("status") == "success":
-            # Actualizar la lista en memoria
-            updated_tasks = [task for task in tasks if task['id'] != task_id]
-            LAST_TASKS_LIST[chat_id] = updated_tasks
-            
-            # Recalcular la página actual por si era la última tarea de la página
-            total_pages = (len(updated_tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE
-            current_page = min(page, total_pages - 1)
-            
-            if not updated_tasks:
-                await query.edit_message_text(text=f"✅ ¡Excelente! Has completado '{task_title}'.\n\n¡No quedan más tareas pendientes en esta lista!")
-            else:
-                keyboard = create_task_keyboard(updated_tasks, current_page)
-                await query.edit_message_text(text=f"✅ ¡Bien hecho! Has completado '{task_title}'.\n\nAquí está tu lista actualizada:", reply_markup=keyboard)
+            await query.edit_message_text(text=f"✅ ¡Tarea completada!\n\n_{result.get('title')}_", parse_mode=ParseMode.MARKDOWN)
         else:
-            await query.message.reply_text(f"❌ No pude actualizar la tarea: {result.get('message', 'Error desconocido')}")
+            await query.edit_message_text(text=f"❌ Error al completar la tarea: {result.get('message')}")
+            
+    # Aquí se podrían añadir más acciones para otros botones (ej: 'posponer', 'editar')
 
 # -----------------------------------------------------------------------------
 # 6. LÓGICA DEL BOT DE TELEGRAM
 # -----------------------------------------------------------------------------
-USER_CONTEXT = {}  # {chat_id: {"last_intent": "...", "data": {...}}}
-LAST_TASKS_LIST = {} # {chat_id: [lista de tareas]}
 
 def add_to_history(history, role, content):
     """Añade una entrada al historial de conversación."""
@@ -508,11 +479,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.message.chat_id
 
-    # Inicializa el historial de conversación si no existe.
+    # 1. GESTIONAR RESPUESTAS CONTEXTUALES (CRUCIAL PARA APRENDIZAJE Y CONFIRMACIONES)
+    user_context = USER_CONTEXT.get(chat_id)
+    if user_context:
+        last_intent = user_context.get("last_intent")
+        
+        # --- Flujo de confirmación de creación de tarea ---
+        if last_intent == "confirm_creation":
+            if user_text.lower() in ["sí, crear", "si, crear", "si", "crear"]:
+                task_data = user_context["data"]
+                try:
+                    # Se crea la tarea sin la verificación de similitud esta vez
+                    notion.pages.create(
+                        parent={"database_id": NOTION_DATABASE_ID},
+                        properties={
+                            "Nombre de tarea": {"title": [{"text": {"content": task_data["title"]}}]},
+                            "Etiquetas": {"multi_select": [{"name": task_data["category"]}]},
+                            "Fecha límite": {"date": {"start": task_data["due_date"]}},
+                            "Descripción": {"rich_text": [{"text": {"content": task_data.get("description", "")}}]},
+                            "Estado": {"status": {"name": "Por hacer"}}
+                        }
+                    )
+                    await update.message.reply_text(f"✅ ¡Nueva tarea creada con éxito!")
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Error al crear la tarea: {e}")
+            else:
+                await update.message.reply_text("Creación de tarea cancelada.")
+            USER_CONTEXT.pop(chat_id, None)
+            return
+
+        # --- Flujo de aprendizaje de alias ---
+        elif last_intent == "confirm_alias":
+            context_data = user_context["data"]
+            original_intent = context_data["original_intent"]
+            task_id = context_data["task_id"]
+            real_title = context_data["real_title"]
+            potential_alias = context_data["potential_alias"]
+
+            feedback_msg = ""
+            if user_text.lower() in ["si", "sí", "yes", "ok", "vale", "guárdalo"]:
+                utils.add_alias(potential_alias, task_id)
+                feedback_msg = f"👍 ¡Entendido! He guardado '{potential_alias}' como un atajo.\n\n"
+            else:
+                feedback_msg = "OK. No guardaré el atajo esta vez.\n\n"
+            
+            # Ejecutar la acción original que se había pausado
+            result = {}
+            if original_intent["action"] == "update_task":
+                 result = edit_task_properties(
+                    task_id=task_id, 
+                    new_status=original_intent.get("new_status"),
+                    new_due_date=original_intent.get("new_due_date"),
+                    new_category=original_intent.get("new_category")
+                )
+                 if result.get("status") == "success":
+                     await update.message.reply_text(f"{feedback_msg}✅ ¡Tarea '{real_title}' actualizada!")
+                 else:
+                     await update.message.reply_text(f"{feedback_msg}❌ Error al actualizar: {result.get('message')}")
+            
+            USER_CONTEXT.pop(chat_id, None)
+            return
+
+    # 2. SI NO HAY CONTEXTO, INTERPRETAR CON OPENAI
     if 'history' not in context.user_data:
         context.user_data['history'] = []
 
-    # Añade el mensaje actual del usuario al historial para dar contexto a la IA.
     add_to_history(context.user_data['history'], "user", user_text)
 
     try:
@@ -555,7 +586,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     USER_CONTEXT[chat_id] = {"last_intent": "ask_reminder", "data": {"title": result["title"], "due_date": result["due_date"]}}
                     await update.message.reply_text("¿Quieres que te ponga un recordatorio para esta tarea? (ej: 'sí, 30 minutos antes')")
             elif result["status"] == "confirm_creation":
-                # Guardar contexto para la confirmación
+                await update.message.reply_text(result["message"])
                 task_data = {
                     "title": params.get("title"),
                     "description": params.get("description", ""),
@@ -563,7 +594,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "due_date": normalize_date(params.get("due_date")),
                 }
                 USER_CONTEXT[chat_id] = {"last_intent": "confirm_creation", "data": task_data}
-                await update.message.reply_text(result["message"])
             else:
                 await update.message.reply_text(f"❌ Error: {result['message']}")
         
@@ -620,7 +650,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ ¡Tarea '{result['title']}' actualizada! Se estableció {', '.join(changes_list)}.")
             elif result["status"] == "confirm_alias":
                 USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?** (Sí/No)")
+                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
             else:
                 await update.message.reply_text(f"❌ Error: {result['message']}")
 
@@ -641,7 +671,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"👍 {result['message']}")
             elif result["status"] == "confirm_alias":
                 USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?** (Sí/No)")
+                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
             else:
                 await update.message.reply_text(f"❌ Error: {result['message']}")
 
@@ -661,7 +691,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"🗑️ ¡Tarea '{result['title']}' archivada con éxito!")
             elif result["status"] == "confirm_alias":
                 USER_CONTEXT[chat_id] = {"last_intent": "confirm_alias", "data": result["data"]}
-                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?** (Sí/No)")
+                await update.message.reply_text(f"{result['message']}\n\n**¿Quieres que guarde '{result['data']['potential_alias']}' como un atajo para el futuro?**\n(Sí/No)", parse_mode=ParseMode.MARKDOWN)
             else:
                 await update.message.reply_text(f"❌ Error: {result['message']}")
             
@@ -674,40 +704,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Lo siento, no pude procesar tu solicitud. Intenta de nuevo más tarde.")
 
 # -----------------------------------------------------------------------------
-# 7. TAREAS PROGRAMADAS
+# 7. TAREAS PROGRAMADAS Y COMANDOS ESPECIALES
 # -----------------------------------------------------------------------------
-async def send_daily_briefing(application: Application):
-    """Prepara y envía un resumen diario de las tareas del día."""
-    if not TELEGRAM_CHAT_ID:
-        logging.warning("No se puede enviar el briefing diario: TELEGRAM_CHAT_ID no está configurado.")
+
+async def generate_and_send_briefing(application: Application, chat_id: int):
+    """Función central que genera y envía el briefing."""
+    logging.info(f"Generando briefing para el chat_id: {chat_id}")
+    tasks = list_tasks_notion(status="Por hacer")
+    if isinstance(tasks, dict) and tasks.get("status") == "error":
+        await application.bot.send_message(chat_id=chat_id, text=f"Error al obtener tareas para el briefing: {tasks['message']}")
         return
-    
-    logging.info("Ejecutando briefing diario...")
-    
-    today_str = date.today().isoformat()
-    all_tasks = list_tasks_notion(status="Por hacer") # Obtener todas las tareas pendientes
-    
-    if isinstance(all_tasks, dict) and all_tasks.get("status") == "error":
-        logging.error(f"Error al obtener tareas para el briefing: {all_tasks['message']}")
+    if not tasks:
+        await application.bot.send_message(chat_id=chat_id, text="¡Buenos días! No tienes tareas pendientes para hoy. ¡Aprovecha el día! ☀️")
         return
-        
-    tasks_for_today = [task for task in all_tasks if task.get("due") and task["due"] == today_str]
+
+    task_list_str = "\n".join([f"- {task['title']}" for task in tasks])
     
-    if not tasks_for_today:
-        message = "¡Buenos días! ☀️ No he encontrado tareas programadas para hoy. ¡Que tengas un día despejado y productivo!"
-        await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        return
-        
     try:
-        task_list_str = "\n".join([f"- {task['title']}" for task in tasks_for_today])
-        
-        briefing_prompt = (
-            "Eres un asistente ejecutivo de élite. A continuación se presenta una lista de tareas para hoy. "
-            "Tu trabajo es redactar un resumen matutino para tu jefe. Sé breve, profesional y motivador. "
-            "Destaca la tarea que parezca más importante o urgente. No uses más de 70 palabras."
-            f"\n\nTareas de hoy:\n{task_list_str}"
-        )
-        
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -716,73 +729,54 @@ async def send_daily_briefing(application: Application):
             ],
             response_format={"type": "json_object"},
         )
-        
         briefing_text = json.loads(response.choices[0].message.content).get("briefing", "No se pudo generar el resumen de hoy.")
         message = f"¡Buenos días! ☀️ Aquí tienes tu briefing para hoy:\n\n{briefing_text}"
-        
-        await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        logging.info("Briefing diario enviado con éxito.")
-        
+        await application.bot.send_message(chat_id=chat_id, text=message)
     except Exception as e:
-        logging.error(f"Error al generar o enviar el briefing diario: {e}")
+        logging.error(f"Error al generar briefing con OpenAI: {e}")
+        await application.bot.send_message(chat_id=chat_id, text="Tuve problemas para generar el resumen de hoy, pero estas son tus tareas pendientes:\n\n" + task_list_str)
 
+async def scheduled_briefing(context: ContextTypes.DEFAULT_TYPE):
+    """Tarea programada que llama a la función de briefing."""
+    application = context.application
+    await generate_and_send_briefing(application, TELEGRAM_CHAT_ID)
+
+async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manejador para el comando /briefing."""
+    await update.message.reply_text("Generando tu briefing, un momento por favor...")
+    await generate_and_send_briefing(context.application, update.effective_chat.id)
+
+# -----------------------------------------------------------------------------
+# 8. INICIO DEL BOT
+# -----------------------------------------------------------------------------
 async def run_telegram_bot():
-    """Inicializa y corre el bot de Telegram, adaptándose al entorno (polling o webhook)."""
-    nest_asyncio.apply()
-    
-    # Inicializar la BD
+    """Configura y corre el bot de Telegram."""
     init_db()
 
-    # Configurar el scheduler
-    scheduler = AsyncIOScheduler()
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # --- Jobs Programados ---
-    # Job para recordatorios (cada minuto)
-    scheduler.add_job(check_reminders, 'interval', minutes=1, args=[application])
+    # Configura el scheduler para los recordatorios y el briefing
+    scheduler = AsyncIOScheduler(timezone="America/Santiago")
+    scheduler.add_job(check_reminders, "interval", minutes=1)
     
-    # Job para el briefing diario
-    if TELEGRAM_CHAT_ID:
+    # Tarea programada para el briefing diario
+    if BRIEFING_TIME and TELEGRAM_CHAT_ID:
         try:
             hour, minute = map(int, BRIEFING_TIME.split(':'))
-            scheduler.add_job(send_daily_briefing, 'cron', hour=hour, minute=minute, args=[application])
+            scheduler.add_job(scheduled_briefing, "cron", hour=hour, minute=minute)
             logging.info(f"Briefing diario programado para las {BRIEFING_TIME} todos los días.")
         except ValueError:
-            logging.error(f"El formato de BRIEFING_TIME ('{BRIEFING_TIME}') no es válido. Debe ser HH:MM.")
+            logging.error("Formato de BRIEFING_TIME incorrecto. Debe ser HH:MM.")
 
-    # --- Handlers ---
+    # Crea la aplicación de Telegram
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("briefing", briefing_command)) # Handler para /briefing
     application.add_handler(CallbackQueryHandler(button_handler))
-
-    # --- Lógica de Arranque (Webhook vs. Polling) ---
-    webhook_url = os.getenv("WEBHOOK_URL")
-    port = int(os.getenv("PORT", 8080))
-
-    if webhook_url:
-        # Modo Webhook (para producción en Render)
-        await application.bot.set_webhook(url=webhook_url)
-        logging.info(f"Bot iniciado en modo WEBHOOK en el puerto {port}")
-        scheduler.start()
-        try:
-            await application.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                webhook_url=webhook_url
-            )
-        finally:
-            scheduler.shutdown()
-            await application.bot.delete_webhook()
-            logging.info("Webhook eliminado y scheduler detenido.")
-    else:
-        # Modo Polling (para desarrollo local)
-        logging.info("Bot iniciado en modo POLLING")
-        scheduler.start()
-        try:
-            await application.run_polling()
-        finally:
-            scheduler.shutdown()
-            logging.info("Polling detenido y scheduler detenido.")
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Inicia el scheduler
+    scheduler.start()
 
 def run_cli():
     """Ejecuta el asistente en modo línea de comandos para pruebas."""
