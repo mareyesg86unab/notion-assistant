@@ -1,22 +1,32 @@
+# Archivo de configuración para desplegar el asistente Olivia en Render.com
+
 services:
   - type: web
     name: asistoliv
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-  envVars:
-     - key: MODE
-       value: telegram
-     - key: PORT
-       value: 8080
-     - key: WEBHOOK_URL
-       value: https://olivia-notion-bot.onrender.com/
-       sync: false
-     - key: OPENAI_API_KEY
-       sync: false
-     - key: NOTION_API_TOKEN
-       sync: false
-     - key: NOTION_DATABASE_ID
-       sync: false
-     - key: TELEGRAM_TOKEN
-       sync: false
+
+    # Fija la versión de Python a una estable y compatible (3.11)
+    # para evitar errores de incompatibilidad con las librerías del proyecto.
+    pythonVersion: "3.11"
+
+    # Comando para instalar todas las dependencias antes de iniciar.
+    buildCommand: "pip install -r requirements.txt"
+
+    # Comando que Render ejecutará para iniciar el bot.
+    startCommand: "python main.py"
+
+    # Definición de las variables de entorno.
+    # Los secretos (tokens, API keys) se deben configurar en el dashboard de Render.
+    envVars:
+      # El puerto en el que la aplicación escuchará. Render lo necesita.
+      - key: PORT
+        value: 8080
+
+      # Configuración automática de la URL para el Webhook.
+      # Render tomará la URL pública del servicio y la asignará a esta variable.
+      # Esto es más robusto que escribir la URL manualmente.
+      - key: WEBHOOK_URL
+        fromService:
+          type: web
+          name: asistoliv # Debe coincidir con el 'name' de este servicio
+          property: url
