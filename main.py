@@ -588,9 +588,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4-turbo-preview",
-            messages=history,
-            response_format={"type": "json_object"}
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *context.user_data["history"],
+                {"role": "user", "content": f"Basado en el historial y la nueva petición '{user_input}', determina la acción a realizar. Responde en formato JSON."}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
         )
         intent_json = json.loads(response.choices[0].message.content)
         intent = intent_json.get("intent", "unknown")
@@ -765,13 +770,16 @@ async def send_daily_briefing(application: Application):
         )
         
         response = client.chat.completions.create(
-            model="gpt-4-turbo-preview",
-            messages=[{"role": "system", "content": briefing_prompt}],
-            temperature=0.5,
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un asistente de productividad. Resume la siguiente lista de tareas para hoy en un solo párrafo conciso y motivador. Responde en formato JSON con una clave 'briefing'."},
+                {"role": "user", "content": f"Tareas para hoy ({date.today().strftime('%d de %B')}): {task_list_str}"}
+            ],
+            response_format={"type": "json_object"},
         )
         
-        summary = response.choices[0].message.content
-        message = f"¡Buenos días! ☀️ Aquí tienes tu briefing para hoy:\n\n{summary}"
+        briefing_text = json.loads(response.choices[0].message.content).get("briefing", "No se pudo generar el resumen de hoy.")
+        message = f"¡Buenos días! ☀️ Aquí tienes tu briefing para hoy:\n\n{briefing_text}"
         
         await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         logging.info("Briefing diario enviado con éxito.")
