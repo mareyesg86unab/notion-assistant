@@ -13,6 +13,7 @@ import asyncio
 from difflib import get_close_matches
 import logging
 from unidecode import unidecode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Importar la función de búsqueda mejorada desde utils
 from utils import find_task_by_title_enhanced, set_reminder_db, init_db, check_reminders
