@@ -57,6 +57,9 @@ SYSTEM_PROMPT = (
     'Tu respuesta JSON: {"action": "set_reminder", "parameters": {"title": "revisar el informe", "reminder_str": "mañana a las 10"}}\\n'
 )
 
+# Almacenamiento en memoria para las listas de tareas paginadas
+LAST_TASKS_LIST = {}
+
 # Diccionario para gestionar conversaciones contextuales (ej. confirmaciones)
 USER_CONTEXT = {}
 
@@ -272,8 +275,9 @@ def edit_task_properties(task_id: str = None, title: str = None, new_status: str
 
     try:
         notion.pages.update(page_id=task_id, properties=properties_to_update)
-        return {"status": "success", "action": "edit_task", "title": title or f"ID {task_id}", "changes": properties_to_update}
+        return {"status": "success", "action": "edit", "title": title, "changes": properties_to_update}
     except Exception as e:
+        logging.error(f"Error al editar la tarea en Notion: {e}")
         return {"status": "error", "message": f"Error al editar la tarea: {e}"}
 
 def set_reminder_for_task(chat_id: int, task_id: str = None, title: str = None, reminder_str: str = None):
@@ -343,137 +347,91 @@ def delete_task_notion(task_id: str = None, title: str = None):
         notion.pages.update(page_id=task_id, archived=True)
         return {"status": "success", "action": "delete_task", "title": title or f"ID {task_id}"}
     except Exception as e:
-        return {"status": "error", "message": f"Error al eliminar la tarea: {e}"}
+        return {"status": "error", "message": f"Error al archivar la tarea: {e}"}
 
 # -----------------------------------------------------------------------------
-# 4. DEFINICIÓN DE FUNCIONES PARA OPENAI
-# -----------------------------------------------------------------------------
-
-functions = [
-    {
-        "name": "create_task",
-        "description": "Crea una tarea nueva en Notion.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "El título de la tarea."},
-                "description": {"type": "string", "description": "Una descripción opcional para la tarea."},
-                "category": {"type": "string", "description": f"La categoría de la tarea. Debe ser una de: {', '.join(VALID_CATEGORIES)}"},
-                "due_date": {"type": "string", "description": "La fecha de entrega, ej. 'mañana', '31 de diciembre', '25/12/2024'."}
-            },
-            "required": ["title", "category", "due_date"]
-        }
-    },
-    {
-        "name": "list_tasks",
-        "description": "Recupera una lista de tareas, opcionalmente filtradas por categoría o estado.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {"type": "string", "description": f"Filtrar por categoría. Opciones: {', '.join(VALID_CATEGORIES)}"},
-                "status": {"type": "string", "enum": ["Por hacer", "En progreso", "Hecho"], "description": "Filtrar por estado."}
-            }
-        }
-    },
-    {
-        "name": "update_task",
-        "description": "Actualiza el estado de una tarea existente, identificada por su título o ID.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "El ID de la tarea a actualizar."},
-                "title": {"type": "string", "description": "El título de la tarea a actualizar."},
-                "status": {"type": "string", "enum": ["Por hacer", "En progreso", "Hecho"], "description": "El nuevo estado de la tarea."}
-            },
-            "required": ["status"]
-        }
-    },
-    {
-        "name": "delete_task",
-        "description": "Elimina (archiva) una tarea existente, identificada por su título o ID.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "El ID de la tarea a eliminar."},
-                "title": {"type": "string", "description": "El título de la tarea a eliminar."}
-            }
-        }
-     },
-    {
-        "name": "set_reminder",
-        "description": "Configura un recordatorio para una tarea existente. El usuario debe especificar cuánto tiempo antes de la fecha límite.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "El título de la tarea para la cual se configura el recordatorio."},
-                "reminder_str": {"type": "string", "description": "Descripción del tiempo para el recordatorio, ej: '30 minutos antes', '1 hora antes', '2 dias antes'."}
-            },
-            "required": ["title", "reminder_str"]
-        }
-    }
-]
-
-# -----------------------------------------------------------------------------
-# 5. TELEGRAM INTERACTIVE COMPONENTS
+# 4. COMPONENTES DE LA INTERFAZ DE TELEGRAM (TECLADOS)
 # -----------------------------------------------------------------------------
 TASKS_PER_PAGE = 5
 
 def create_task_keyboard(tasks: list, page: int = 0) -> InlineKeyboardMarkup:
-    """Crea un teclado interactivo para la lista de tareas con paginación."""
     keyboard = []
-    
     start_index = page * TASKS_PER_PAGE
     end_index = start_index + TASKS_PER_PAGE
-    tasks_on_page = tasks[start_index:end_index]
-
+    
     # Botones para cada tarea en la página actual
-    for task in tasks_on_page:
-        # El callback_data incluye la página actual para poder volver a ella después de una acción
-        callback_data = f"complete_{page}_{task['id']}"
-        keyboard.append([InlineKeyboardButton(f"✅ {task['title']}", callback_data=callback_data)])
-
+    for task in tasks[start_index:end_index]:
+        # El callback_data ahora incluye la página actual para poder volver a ella
+        button = [InlineKeyboardButton(f"✅ {task['title']}", callback_data=f"complete_{page}_{task['id']}")]
+        keyboard.append(button)
+        
     # Botones de paginación
-    total_pages = (len(tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE
-    if total_pages > 1:
-        pagination_row = []
-        if page > 0:
-            pagination_row.append(InlineKeyboardButton("◀️ Anterior", callback_data=f"page_{page-1}"))
+    pagination_buttons = []
+    if page > 0:
+        pagination_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"page_{page-1}"))
+    if end_index < len(tasks):
+        pagination_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"page_{page+1}"))
         
-        pagination_row.append(InlineKeyboardButton(f"Pág {page+1}/{total_pages}", callback_data="noop"))
-        
-        if page < total_pages - 1:
-            pagination_row.append(InlineKeyboardButton("Siguiente ▶️", callback_data=f"page_{page+1}"))
-        
-        keyboard.append(pagination_row)
+    if pagination_buttons:
+        keyboard.append(pagination_buttons)
         
     return InlineKeyboardMarkup(keyboard)
 
+# -----------------------------------------------------------------------------
+# 5. MANEJADORES DE TELEGRAM (HANDLERS)
+# -----------------------------------------------------------------------------
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los clics en los botones del teclado interactivo."""
     query = update.callback_query
     await query.answer()
+
+    chat_id = query.message.chat_id
+    action, *params = query.data.split('_')
     
-    action, task_id = query.data.split(':')
+    # Recuperar la lista de tareas de la memoria del bot
+    tasks = LAST_TASKS_LIST.get(chat_id, [])
+    if not tasks:
+        await query.edit_message_text("Esta lista de tareas ha expirado. Por favor, pídemela de nuevo con 'listar tareas'.")
+        return
 
-    if action == "complete_task":
-        # CORRECCIÓN: Usar 'new_status' en lugar de 'status' para que coincida con la firma de la función.
+    if action == "page":
+        page = int(params[0])
+        keyboard = create_task_keyboard(tasks, page)
+        await query.edit_message_text(text="Aquí están tus tareas pendientes:", reply_markup=keyboard)
+
+    elif action == "complete":
+        page = int(params[0])
+        task_id = params[1]
+        
+        task_title = next((task['title'] for task in tasks if task['id'] == task_id), 'la tarea')
+        
         result = edit_task_properties(task_id=task_id, new_status="Hecho")
+        
         if result.get("status") == "success":
-            await query.edit_message_text(text=f"✅ ¡Tarea completada!\n\n_{result.get('title')}_", parse_mode=ParseMode.MARKDOWN)
-        else:
-            await query.edit_message_text(text=f"❌ Error al completar la tarea: {result.get('message')}")
+            # Actualizar la lista en memoria eliminando la tarea completada
+            updated_tasks = [task for task in tasks if task['id'] != task_id]
+            LAST_TASKS_LIST[chat_id] = updated_tasks
             
-    # Aquí se podrían añadir más acciones para otros botones (ej: 'posponer', 'editar')
-
-# -----------------------------------------------------------------------------
-# 6. LÓGICA DEL BOT DE TELEGRAM
-# -----------------------------------------------------------------------------
+            # Recalcular la página actual por si era la última tarea de la página
+            total_pages = (len(updated_tasks) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE
+            current_page = min(page, total_pages - 1)
+            
+            if not updated_tasks:
+                await query.edit_message_text(text=f"✅ ¡Excelente! Has completado '{task_title}'.\n\n¡No quedan más tareas pendientes en esta lista!")
+            else:
+                keyboard = create_task_keyboard(updated_tasks, current_page)
+                await query.edit_message_text(text=f"✅ ¡Bien hecho! Has completado '{task_title}'.\n\nAquí está tu lista actualizada:", reply_markup=keyboard)
+        else:
+            # Si hay un error, no editar el mensaje, sino enviar uno nuevo para no perder el teclado
+            await query.message.reply_text(f"❌ No pude actualizar la tarea: {result.get('message', 'Error desconocido')}")
 
 def add_to_history(history, role, content):
     """Añade una entrada al historial de conversación."""
     history.append({"role": role, "content": content})
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("¡Hola! Soy Olivia, tu asistente para Notion. ¿En qué puedo ayudarte hoy?")
+    await update.message.reply_text(f"¡Hola! Soy Olivia, tu asistente para Notion. ¿En qué puedo ayudarte hoy?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -612,17 +570,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif intent == "list_tasks":
             tasks = list_tasks_notion(
                 category=params.get("category"),
-                status=params.get("status") or "Por hacer"  # Por defecto, mostrar solo las tareas por hacer
+                status=params.get("status") or "Por hacer"
             )
             if isinstance(tasks, list):
                 if not tasks:
-                    await update.message.reply_text("¡Felicidades! No tienes tareas pendientes con esos criterios.")
+                    await update.message.reply_text("¡No tienes tareas pendientes que coincidan con tu búsqueda! 🎉")
                 else:
-                    LAST_TASKS_LIST[chat_id] = tasks # Guardar lista para referencia futura
+                    # Guardar la lista de tareas en memoria para la paginación
+                    LAST_TASKS_LIST[chat_id] = tasks
                     keyboard = create_task_keyboard(tasks, page=0)
                     await update.message.reply_text("Aquí están tus tareas pendientes. ¡Puedes completarlas directamente desde aquí!", reply_markup=keyboard)
             else:
-                await update.message.reply_text(f"❌ Error: {tasks.get('message', 'Error desconocido')}")
+                await update.message.reply_text(f"❌ Error al listar tareas: {tasks.get('message')}")
 
         # --- ACTUALIZAR TAREA ---
         elif intent == "update_task":
@@ -778,6 +737,28 @@ async def run_telegram_bot():
     
     # Inicia el scheduler
     scheduler.start()
+    
+    # Lógica de arranque: Webhook para producción, Polling para desarrollo
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        port = int(os.getenv("PORT", 8080))
+        logging.info(f"Iniciando bot en modo WEBHOOK en el puerto {port}")
+        try:
+            await application.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                webhook_url=webhook_url
+            )
+        finally:
+            scheduler.shutdown()
+            logging.info("Webhook detenido y scheduler apagado.")
+    else:
+        logging.info("Iniciando bot en modo POLLING")
+        try:
+            await application.run_polling()
+        finally:
+            scheduler.shutdown()
+            logging.info("Polling detenido y scheduler apagado.")
 
 def run_cli():
     """Ejecuta el asistente en modo línea de comandos para pruebas."""
