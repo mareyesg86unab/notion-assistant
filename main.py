@@ -237,13 +237,35 @@ def normalize_date(date_str: str) -> str | None:
         return dt.isoformat()
 
 def create_task_notion(title: str, category: str = None, due_date: str = None, description: str = None):
+    """Crea una tarea en Notion, evitando duplicados."""
     logger.info(f"Tool Call: create_task_notion('{title}')")
-    props = {"Nombre de tarea": {"title": [{"text": {"content": title}}]}, "Estado": {"status": {"name": "Por hacer"}}}
-    if category: props["Etiquetas"] = {"multi_select": [{"name": category}]}
+    
+    # 1. Verificar si ya existe una tarea similar para evitar duplicados
+    task_id, existing_title = find_task_by_title_enhanced(title)
+    if task_id:
+        logger.warning(f"Se intentó crear una tarea duplicada. Título proporcionado: '{title}', Título existente: '{existing_title}'")
+        return json.dumps({
+            "status": "skipped",
+            "message": f"Parece que ya existe una tarea similar llamada '{existing_title}'. No se creó una nueva para evitar duplicados."
+        })
+
+    # 2. Si no hay duplicados, proceder a crear la tarea
+    props = {
+        "Nombre de tarea": {"title": [{"text": {"content": title}}]},
+        "Estado": {"status": {"name": "Por hacer"}}
+    }
+    if category:
+        props["Etiquetas"] = {"multi_select": [{"name": category}]}
     if due_date: 
         norm_date = normalize_date(due_date)
-        if norm_date: props["Fecha límite"] = {"date": {"start": norm_date}}
-    if description: props["Descripción"] = {"rich_text": [{"text": {"content": description}}]}
+        if norm_date:
+            # Notion requiere un objeto 'date' con 'start' y opcionalmente 'end'
+            date_payload = {"start": norm_date}
+            # Si la fecha normalizada es ISO 8601 (contiene 'T'), Notion la tratará como fecha y hora.
+            props["Fecha límite"] = {"date": date_payload}
+    if description:
+        props["Descripción"] = {"rich_text": [{"text": {"content": description}}]}
+        
     try:
         notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=props)
         return json.dumps({"status": "success", "message": f"Tarea '{title}' creada con éxito."})
