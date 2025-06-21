@@ -73,6 +73,14 @@ Tu nombre es Olivia, una asistente personal experta en Notion y en gestión del 
 - **Fechas:** Cuando Mau mencione fechas ("mañana", "próximo martes", "25 de dic"), normalízalas al formato YYYY-MM-DD usando la herramienta `normalize_date` antes de pasarlas a Notion.
 - **Recordatorios:** Cuando Mau pida un recordatorio, usa `set_reminder_notion`. Explícale cuándo le recordarás. Ej: "Ok, te recordaré sobre '...' 2 horas antes de su vencimiento."
 
+# Manejo de Conversaciones de Múltiples Pasos
+- **Memoria a Corto Plazo:** Si haces una pregunta para obtener información necesaria para una herramienta (como pedir una fecha para `update_task_notion`), DEBES recordar el contexto. Cuando el usuario te responda, utiliza esa respuesta para completar la acción original. No vuelvas a preguntar lo que ya sabes ni intentes realizar una acción diferente.
+- **Ejemplo de Flujo Correcto:**
+    1. Usuario: "Ponle un recordatorio a la tarea de las vacaciones".
+    2. Olivia (tú): (Llamas a `set_reminder_notion`, ves que falla por falta de fecha). "Para poner un recordatorio, la tarea 'Planificar vacaciones' necesita una fecha de vencimiento. ¿Te gustaría agregar una ahora?"
+    3. Usuario: "Sí, el 30 de diciembre".
+    4. Olivia (tú): (Llamas a `update_task_notion` con `new_due_date='30 de diciembre'`). "Listo, he actualizado la fecha de la tarea. Ahora, ¿cuándo quieres el recordatorio (ej. 1 día antes)?"
+
 Tu objetivo es ser la mejor asistente que Mau podría tener, haciendo su vida más simple y organizada.
 """
 
@@ -317,26 +325,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(client.beta.threads.messages.create, thread_id=thread_id, role="user", content=user_message)
         run = await asyncio.to_thread(client.beta.threads.runs.create, thread_id=thread_id, assistant_id=ASSISTANT_ID)
 
-        while run.status in ["queued", "in_progress"]:
-            await asyncio.sleep(1.5)
+        # Bucle principal para gestionar el ciclo de vida del "run"
+        while True:
+            await asyncio.sleep(1.5) # Dar tiempo para que el estado cambie
             run = await asyncio.to_thread(client.beta.threads.runs.retrieve, thread_id=thread_id, run_id=run.id)
 
-        if run.status == "requires_action":
-            tool_calls = run.required_action.submit_tool_outputs.tool_calls
-            tool_outputs = await asyncio.gather(*[execute_tool_call(tc, chat_id) for tc in tool_calls])
-            run = await asyncio.to_thread(client.beta.threads.runs.submit_tool_outputs, thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
-            while run.status in ["queued", "in_progress"]:
-                await asyncio.sleep(1.5)
-                run = await asyncio.to_thread(client.beta.threads.runs.retrieve, thread_id=thread_id, run_id=run.id)
+            if run.status == "completed":
+                messages = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id, limit=1)
+                response_text = messages.data[0].content[0].text.value
+                await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN)
+                break  # Salir del bucle
 
-        if run.status == "completed":
-            messages = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id, limit=1)
-            response_text = messages.data[0].content[0].text.value
-            await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN)
-        else:
-            logger.error(f"Run {run.id} terminó con estado: {run.status}. Razón: {run.last_error}")
-            error_message = run.last_error.message if run.last_error else "sin detalles"
-            await update.message.reply_text(f"Lo siento, la operación falló ({error_message}).")
+            if run.status in ["queued", "in_progress"]:
+                continue  # Continuar esperando
+
+            if run.status == "requires_action":
+                tool_calls = run.required_action.submit_tool_outputs.tool_calls
+                tool_outputs = await asyncio.gather(*[execute_tool_call(tc, chat_id) for tc in tool_calls])
+                
+                # Enviar los resultados y volver al inicio del bucle para esperar el siguiente estado
+                run = await asyncio.to_thread(
+                    client.beta.threads.runs.submit_tool_outputs,
+                    thread_id=thread_id,
+                    run_id=run.id,
+                    tool_outputs=tool_outputs
+                )
+                continue # Volver a esperar
+
+            # Si el estado es fallido, cancelado o expirado, informar y salir.
+            if run.status in ["failed", "cancelled", "expired"]:
+                logger.error(f"Run {run.id} terminó con estado: {run.status}. Razón: {run.last_error}")
+                error_message = run.last_error.message if run.last_error else "sin detalles"
+                await update.message.reply_text(f"Lo siento, la operación falló ({error_message}).")
+                break # Salir del bucle
             
     except Exception as e:
         logger.error(f"Error en handle_message para chat {chat_id}: {e}", exc_info=True)
