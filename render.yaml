@@ -1,33 +1,20 @@
 # Archivo de configuración para desplegar el asistente Olivia en Render.com
 
 services:
-  - type: web
+  # Cambiado de 'web' a 'worker' porque el bot ya no usa webhooks.
+  - type: worker 
     name: asistoliv
     env: python
 
-    # Comando para instalar todas las dependencias antes de iniciar.
+    # Comando para instalar todas las dependencias.
     buildCommand: "pip install -r requirements.txt"
 
-    # Comando que Render ejecutará para iniciar el bot.
+    # Comando para iniciar el bot.
     startCommand: "python main.py"
 
-    # Definición de las variables de entorno.
-    # Los secretos (tokens, API keys) se deben configurar en el dashboard de Render.
+    # Variables de entorno.
+    # Los secretos (tokens, API keys) se gestionan desde el dashboard.
     envVars:
-      # Fija la versión de Python a una estable y compatible (3.11)
-      # para evitar errores de incompatibilidad con las librerías del proyecto.
+      # Fija la versión de Python para asegurar la compatibilidad.
       - key: PYTHON_VERSION
-        value: "3.11"
-        
-      # El puerto en el que la aplicación escuchará. Render lo necesita.
-      - key: PORT
-        value: 8080
-
-      # Configuración automática de la URL para el Webhook.
-      # Render tomará la URL pública del servicio y la asignará a esta variable.
-      # Esto es más robusto que escribir la URL manualmente.
-      - key: WEBHOOK_URL
-        fromService:
-          type: web
-          name: asistoliv # Debe coincidir con el 'name' de este servicio
-          property: url
+        value: "3.11.11" # Seamos específicos con la versión
