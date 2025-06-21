@@ -167,40 +167,74 @@ def set_reminder_db(chat_id: int, task_title: str, due_date_str: str, reminder_s
     delta = timedelta(**{delta_map[unit]: value})
 
     try:
-        target_timezone = pytz.timezone('America/Santiago')
-        # La fecha de Notion no tiene timezone, la asumimos como local
+        # La fecha que viene de Notion debería estar en formato ISO 8601.
+        # dateparser la convertirá en un objeto datetime con zona horaria.
         due_datetime = dateparser.parse(due_date_str)
+        if not due_datetime:
+            raise ValueError("No se pudo interpretar la fecha de vencimiento desde Notion.")
+
+        # Como fallback, si la fecha es "naive" (sin zona horaria), se asume que es de Santiago.
+        # Esto ocurre si la tarea en Notion solo tiene una fecha pero no una hora.
         if due_datetime.tzinfo is None:
+            target_timezone = pytz.timezone('America/Santiago')
             due_datetime = target_timezone.localize(due_datetime)
-        
-        # Si la tarea no tiene hora, la ponemos al final del día
-        if due_datetime.hour == 0 and due_datetime.minute == 0:
-             due_datetime = due_datetime.replace(hour=23, minute=59, second=59)
+            # Si solo era una fecha, el recordatorio se basará en el final de ese día.
+            if due_datetime.hour == 0 and due_datetime.minute == 0:
+                due_datetime = due_datetime.replace(hour=23, minute=59, second=59)
 
         remind_time = due_datetime - delta
+        # Para el mensaje al usuario, mostrar la hora en la zona local.
+        local_remind_time = remind_time.astimezone(pytz.timezone('America/Santiago'))
 
     except (ValueError, TypeError) as e:
-        logger.error(f"Error parseando fecha para recordatorio: {e}")
-        return "La fecha de la tarea no es válida para crear un recordatorio."
+        logger.error(f"Error parseando fecha para recordatorio: {e}", exc_info=True)
+        return "La fecha de la tarea no es válida o tiene un formato incorrecto para crear un recordatorio."
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     # Guardamos la hora del recordatorio en UTC para que el scheduler funcione correctamente
-    cursor.execute("INSERT INTO reminders (chat_id, task_title, remind_time) VALUES (?, ?, ?)", (chat_id, task_title, remind_time.astimezone(pytz.utc)))
+    cursor.execute("INSERT INTO reminders (chat_id, task_title, remind_time) VALUES (?, ?, ?)",
+                   (chat_id, task_title, remind_time.astimezone(pytz.utc)))
     conn.commit()
     conn.close()
     
-    return f"OK. Te recordaré sobre '{task_title}' el {remind_time.strftime('%d de %b a las %H:%M')}."
+    return f"OK. Te recordaré sobre '{task_title}' el {local_remind_time.strftime('%d de %b a las %H:%M')}."
 
 # -----------------------------------------------------------------------------
 # 3. FUNCIONES DE "HERRAMIENTAS" PARA EL ASISTENTE DE OPENAI
 # -----------------------------------------------------------------------------
 
 def normalize_date(date_str: str) -> str | None:
-    """Normaliza una cadena de texto a una fecha en formato YYYY-MM-DD."""
-    if not date_str: return None
-    dt = dateparser.parse(date_str, languages=["es"], settings={'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'DMY', 'TIMEZONE': 'America/Santiago'})
-    return dt.strftime("%Y-%m-%d") if dt else None
+    """
+    Normaliza una cadena de texto a una fecha (YYYY-MM-DD) o
+    fecha y hora (formato ISO 8601) si se especifica una hora.
+    """
+    if not date_str:
+        return None
+
+    # Configuración para que dateparser entienda español y prefiera fechas futuras
+    settings = {
+        'PREFER_DATES_FROM': 'future',
+        'DATE_ORDER': 'DMY',
+        'TIMEZONE': 'America/Santiago',
+        'RETURN_AS_TIMEZONE_AWARE': True
+    }
+    
+    dt = dateparser.parse(date_str, languages=["es"], settings=settings)
+    
+    if not dt:
+        return None
+
+    # Heurística para ver si el usuario especificó una hora.
+    time_indicators = ['a las', ':', 'am', 'pm', 'h', 'hora']
+    has_time_specifier = any(indicator in date_str.lower() for indicator in time_indicators)
+
+    # Si no se especifica hora y el resultado es medianoche, devolver solo la fecha.
+    if not has_time_specifier and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        return dt.strftime("%Y-%m-%d")
+    else:
+        # Devolver en formato ISO 8601, que Notion entiende para fecha y hora.
+        return dt.isoformat()
 
 def create_task_notion(title: str, category: str = None, due_date: str = None, description: str = None):
     logger.info(f"Tool Call: create_task_notion('{title}')")
