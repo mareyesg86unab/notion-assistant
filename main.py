@@ -274,20 +274,48 @@ def create_task_notion(title: str, category: str = None, due_date: str = None, d
         return json.dumps({"status": "error", "message": f"Hubo un error al crear la tarea: {e}"})
 
 def list_tasks_notion(category: str = None, status: str = None, due_date: str = None):
+    """Obtiene una lista de tareas de Notion, manejando datos ausentes de forma segura."""
     logger.info("Tool Call: list_tasks_notion")
     filters = []
-    if category: filters.append({"property": "Etiquetas", "multi_select": {"contains": category}})
-    if status: filters.append({"property": "Estado", "status": {"equals": status}})
+    if category:
+        filters.append({"property": "Etiquetas", "multi_select": {"contains": category}})
+    if status:
+        filters.append({"property": "Estado", "status": {"equals": status}})
     if due_date:
         norm_date = normalize_date(due_date)
-        if norm_date: filters.append({"property": "Fecha límite", "date": {"equals": norm_date}})
-    query = {"database_id": NOTION_DATABASE_ID, "filter": {"and": filters}} if filters else {"database_id": NOTION_DATABASE_ID}
+        if norm_date:
+            filters.append({"property": "Fecha límite", "date": {"equals": norm_date}})
+            
+    query = {"database_id": NOTION_DATABASE_ID}
+    if filters:
+        query["filter"] = {"and": filters}
+        
     try:
         response = notion.databases.query(**query)
-        tasks = [{"title": p.get("properties", {}).get("Nombre de tarea", {}).get("title", [{}])[0].get("plain_text", "(Sin título)"),
-                  "status": p.get("properties", {}).get("Estado", {}).get("status", {}).get("name", "N/A"),
-                  "due_date": p.get("properties", {}).get("Fecha límite", {}).get("date", {}).get("start", "N/A")}
-                 for p in response.get("results", [])]
+        tasks = []
+        for p in response.get("results", []):
+            properties = p.get("properties", {})
+            
+            # Extracción segura del título
+            title_list = properties.get("Nombre de tarea", {}).get("title", [])
+            title = title_list[0].get("plain_text", "(Sin título)") if title_list else "(Sin título)"
+            
+            # Extracción segura del estado
+            status_prop = properties.get("Estado")
+            task_status = (status_prop.get("status") or {}).get("name", "N/A") if status_prop else "N/A"
+            
+            # Extracción segura de la fecha límite (causa del error anterior)
+            due_date_prop = properties.get("Fecha límite")
+            due_date_val = "N/A"
+            if due_date_prop and due_date_prop.get("date"):
+                due_date_val = due_date_prop.get("date").get("start") or "N/A"
+
+            tasks.append({
+                "title": title,
+                "status": task_status,
+                "due_date": due_date_val
+            })
+            
         return json.dumps({"status": "success", "data": tasks or "No se encontraron tareas con esos criterios."})
     except Exception as e:
         logger.error(f"Error listando tareas de Notion: {e}", exc_info=True)
